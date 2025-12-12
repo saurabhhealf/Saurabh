@@ -33,6 +33,7 @@ lambda_function = aws.lambda_.Function("klaviyo-event-grab-lambda",
     code=pulumi.AssetArchive({
         '.': pulumi.FileArchive('./lambda')
     }),
+    timeout=600,
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_EVENTS_BUCKET": bucket.bucket,
