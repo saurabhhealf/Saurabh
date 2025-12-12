@@ -1,0 +1,11 @@
+name: klaviyo-to-snowflake
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv
+description: takes klaviyo data and loads it to an s3
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: https://www.pulumi.com/ai/api/project/d2c16692-24ce-42a1-beb6-a02553bcc5fa.zip
