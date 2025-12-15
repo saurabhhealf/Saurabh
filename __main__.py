@@ -4,12 +4,7 @@ import pulumi_aws as aws
 config = pulumi.Config()
 klaviyo_api_secret_name = config.require("klaviyoApiSecretName")
 
-# Create an S3 bucket
-bucket = aws.s3.Bucket("klaviyo-events-bucket")
-
-# Create a Lambda function
-role = aws.iam.Role("lambdaRole",
-    assume_role_policy="""{
+assume_role_policy = """{
     "Version": "2012-10-17",
     "Statement": [
         {
@@ -20,26 +15,65 @@ role = aws.iam.Role("lambdaRole",
             }
         }
     ]
-}""")
+}"""
 
-policy = aws.iam.RolePolicyAttachment("lambdaPolicy",
-    role=role.id,
-    policy_arn="arn:aws:iam::aws:policy/AWSLambdaExecute")
+# Events resources
+events_bucket = aws.s3.Bucket("klaviyo-events-bucket")
 
-lambda_function = aws.lambda_.Function("klaviyo-event-grab-lambda",
-    role=role.arn,
+events_role = aws.iam.Role("eventsLambdaRole", assume_role_policy=assume_role_policy)
+
+aws.iam.RolePolicyAttachment(
+    "eventsLambdaPolicy",
+    role=events_role.id,
+    policy_arn="arn:aws:iam::aws:policy/AWSLambdaExecute",
+)
+
+events_lambda = aws.lambda_.Function(
+    "klaviyo-event-grab-lambda",
+    role=events_role.arn,
     runtime="python3.13",
     handler="index.handler",
     code=pulumi.AssetArchive({
-        '.': pulumi.FileArchive('./lambda')
+        ".": pulumi.FileArchive("./lambda")
     }),
     timeout=600,
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
-            "KLAVIYO_EVENTS_BUCKET": bucket.bucket,
+            "KLAVIYO_EVENTS_BUCKET": events_bucket.bucket,
             "KLAVIYO_API_SECRET_NAME": klaviyo_api_secret_name,
         }
-    ))
+    ),
+)
 
-pulumi.export("bucket_name", bucket.bucket)
-pulumi.export("lambda_function_name", lambda_function.name)
+# Profiles resources
+profiles_bucket = aws.s3.Bucket("klaviyo-profiles-bucket")
+
+profiles_role = aws.iam.Role("profilesLambdaRole", assume_role_policy=assume_role_policy)
+
+aws.iam.RolePolicyAttachment(
+    "profilesLambdaPolicy",
+    role=profiles_role.id,
+    policy_arn="arn:aws:iam::aws:policy/AWSLambdaExecute",
+)
+
+profiles_lambda = aws.lambda_.Function(
+    "klaviyo-profile-grab-lambda",
+    role=profiles_role.arn,
+    runtime="python3.13",
+    handler="index.handler",
+    code=pulumi.AssetArchive({
+        ".": pulumi.FileArchive("./lambda_profiles")
+    }),
+    timeout=600,
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
+            "KLAVIYO_API_SECRET_NAME": klaviyo_api_secret_name,
+        }
+    ),
+)
+
+pulumi.export("events_bucket_name", events_bucket.bucket)
+pulumi.export("events_lambda_function_name", events_lambda.name)
+pulumi.export("profiles_bucket_name", profiles_bucket.bucket)
+pulumi.export("profiles_lambda_function_name", profiles_lambda.name)
