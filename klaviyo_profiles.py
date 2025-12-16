@@ -1,281 +1,177 @@
 #!/usr/bin/env python3
 """
-Klaviyo profiles pull → Snowflake in batches.
-Uses executemany with PARSE_JSON for proper VARIANT insertion.
+Fetch Klaviyo profiles and write each page to S3.
+
+- No Snowflake writes; raw payload per page.
+- No incremental window or deduping; downstream tooling handles that.
+- Relies on env vars (e.g., GitHub Secrets) for configuration:
+    * KLAVIYO_API_KEY
+    * KLAVIYO_PROFILES_BUCKET
+    * KLAVIYO_PROFILES_PREFIX (optional; defaults to profiles/YYYY-MM-DD)
 """
 
-import os
-import sys
 import json
-import time
+import os
 import random
-import base64
-from typing import Dict, List
+import time
+from typing import Any, Dict, Optional
 
+import boto3
 import requests
-import snowflake.connector
-from cryptography.hazmat.primitives import serialization
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# --------------------------
-# CONFIG
-# --------------------------
-API_KEY = os.environ.get("KLAVIYO_API_KEY")
-if not API_KEY:
-    print("[ERROR] KLAVIYO_API_KEY env var is missing")
-    sys.exit(1)
 
 API_REVISION = "2025-10-15"
+PAGE_SIZE = 100
+REQUEST_TIMEOUT = (10, 180)
+CUSTOM_PROFILE_PROPERTIES = {
+    "DATE_OF_BIRTH": "Date_of_Birth",
+    "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
+}
 
-SNOWFLAKE_DB = "HEALF"
-SNOWFLAKE_SCHEMA = "HEALF_BI"
-SNOWFLAKE_TABLE = "KLAVIYO_PROFILES"
-
-BATCH_SIZE = 2000
-
-
-# --------------------------
-# SNOWFLAKE
-# --------------------------
-def _get_private_key_bytes() -> bytes:
-    key_base64 = os.environ["SNOWFLAKE_PRIVATE_KEY"]
-    key_bytes = base64.b64decode(key_base64)
-    p_key = serialization.load_pem_private_key(key_bytes, password=None)
-    return p_key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
+_s3_client = boto3.client("s3")
 
 
-def get_snowflake_connection():
-    return snowflake.connector.connect(
-        user=os.environ["SNOWFLAKE_USER"],
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        database=SNOWFLAKE_DB,
-        schema=SNOWFLAKE_SCHEMA,
-        private_key=_get_private_key_bytes(),
-        role=os.getenv("SNOWFLAKE_ROLE"),
-    )
-
-
-def write_profiles_batch_to_snowflake(conn, profiles: List[Dict]) -> int:
-    """
-    Upsert profiles into Snowflake using MERGE (no duplicates on ID).
-    """
-    if not profiles:
-        return 0
-
-    cursor = conn.cursor()
-
-    try:
-        def esc(v):
-            if v is None:
-                return "NULL"
-            return "'" + str(v).replace("\\", "\\\\").replace("'", "''") + "'"
-
-        def esc_json(v):
-            j = json.dumps(v or {}, ensure_ascii=False).replace("\\", "\\\\").replace("'", "''")
-            return f"'{j}'"
-
-        chunk_size = 100
-        total = 0
-
-        for i in range(0, len(profiles), chunk_size):
-            chunk = profiles[i:i + chunk_size]
-
-            selects = []
-            for p in chunk:
-                selects.append(f"""
-                    SELECT
-                        {esc(p.get("ID"))} AS ID,
-                        {esc(p.get("TYPE"))} AS TYPE,
-                        {esc(p.get("EMAIL"))} AS EMAIL,
-                        {esc(p.get("EXTERNAL_ID"))} AS EXTERNAL_ID,
-                        {esc(p.get("UPDATED"))} AS UPDATED,
-                        {esc(p.get("DATE_OF_BIRTH"))} AS DATE_OF_BIRTH,
-                        {esc(p.get("LAST_FEMALE_CYCLE_STATUS"))} AS LAST_FEMALE_CYCLE_STATUS,
-                        PARSE_JSON({esc_json(p.get("ATTRIBUTES"))}) AS ATTRIBUTES,
-                        PARSE_JSON({esc_json(p.get("PROPERTIES"))}) AS PROPERTIES,
-                        PARSE_JSON({esc_json(p.get("RELATIONSHIPS"))}) AS RELATIONSHIPS,
-                        PARSE_JSON({esc_json(p.get("LINKS"))}) AS LINKS,
-                        PARSE_JSON({esc_json(p.get("SEGMENTS"))}) AS SEGMENTS
-                """)
-
-            using_sql = " UNION ALL ".join(selects)
-
-            merge_sql = f"""
-                MERGE INTO {SNOWFLAKE_DB}.{SNOWFLAKE_SCHEMA}.{SNOWFLAKE_TABLE} t
-                USING (
-                    {using_sql}
-                ) s
-                ON t.ID = s.ID
-                WHEN MATCHED THEN UPDATE SET
-                    TYPE = s.TYPE,
-                    EMAIL = s.EMAIL,
-                    EXTERNAL_ID = s.EXTERNAL_ID,
-                    UPDATED = s.UPDATED,
-                    DATE_OF_BIRTH = s.DATE_OF_BIRTH,
-                    LAST_FEMALE_CYCLE_STATUS = s.LAST_FEMALE_CYCLE_STATUS,
-                    ATTRIBUTES = s.ATTRIBUTES,
-                    PROPERTIES = s.PROPERTIES,
-                    RELATIONSHIPS = s.RELATIONSHIPS,
-                    LINKS = s.LINKS,
-                    SEGMENTS = s.SEGMENTS
-                WHEN NOT MATCHED THEN INSERT (
-                    ID, TYPE, EMAIL, EXTERNAL_ID, UPDATED, DATE_OF_BIRTH, LAST_FEMALE_CYCLE_STATUS,
-                    ATTRIBUTES, PROPERTIES, RELATIONSHIPS, LINKS, SEGMENTS
-                ) VALUES (
-                    s.ID, s.TYPE, s.EMAIL, s.EXTERNAL_ID, s.UPDATED, s.DATE_OF_BIRTH, s.LAST_FEMALE_CYCLE_STATUS,
-                    s.ATTRIBUTES, s.PROPERTIES, s.RELATIONSHIPS, s.LINKS, s.SEGMENTS
-                );
-            """
-
-            cursor.execute(merge_sql)
-            total += len(chunk)
-
-        return total
-
-    finally:
-        cursor.close()
-
-
-# --------------------------
-# HTTP HELPERS
-# --------------------------
-def make_session(pool_maxsize: int = 20) -> requests.Session:
-    s = requests.Session()
+def make_session(api_key: str, pool_maxsize: int = 20) -> requests.Session:
+    session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=pool_maxsize,
         pool_maxsize=pool_maxsize,
         max_retries=0,
     )
-    s.mount("https://", adapter)
-    s.headers.update({
-        "Authorization": f"Klaviyo-API-Key {API_KEY}",
+    session.mount("https://", adapter)
+    session.headers.update({
+        "Authorization": f"Klaviyo-API-Key {api_key}",
         "accept": "application/json",
         "revision": API_REVISION,
         "Connection": "keep-alive",
     })
-    return s
+    return session
 
 
-def safe_get(session, url, params=None, max_retries=7, timeout=(10, 150)):
+def safe_get(session: requests.Session,
+             url: str,
+             params: Optional[Dict[str, Any]] = None,
+             max_retries: int = 7,
+             timeout: tuple = (10, 150)) -> requests.Response:
     attempt = 0
     while True:
         try:
-            resp = session.get(url, params=params, timeout=timeout)
+            response = session.get(url, params=params, timeout=timeout)
         except (requests.exceptions.ReadTimeout,
                 requests.exceptions.ConnectTimeout,
                 requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ConnectionError) as e:
+                requests.exceptions.ConnectionError) as exc:
             attempt += 1
             if attempt > max_retries:
                 raise
-            sleep_s = min(2 ** attempt, 60) + random.uniform(0, 1)
-            print(f"[WARN] Network issue: {e}. Retrying in {sleep_s:.1f}s")
-            time.sleep(sleep_s)
+            sleep_seconds = min(2 ** attempt, 60) + random.uniform(0, 1)
+            print(f"[WARN] Network issue: {exc}. Retrying in {sleep_seconds:.1f}s")
+            time.sleep(sleep_seconds)
             continue
 
-        if resp.status_code in (429, 500, 502, 503, 504):
+        if response.status_code in (429, 500, 502, 503, 504):
             attempt += 1
             if attempt > max_retries:
-                resp.raise_for_status()
-            sleep_s = min(2 ** attempt, 60) + random.uniform(0, 1)
-            print(f"[WARN] HTTP {resp.status_code}. Retrying in {sleep_s:.1f}s")
-            time.sleep(sleep_s)
+                response.raise_for_status()
+            sleep_seconds = min(2 ** attempt, 60) + random.uniform(0, 1)
+            print(f"[WARN] HTTP {response.status_code}. Retrying in {sleep_seconds:.1f}s")
+            time.sleep(sleep_seconds)
             continue
 
-        resp.raise_for_status()
-        return resp
+        if response.status_code == 400:
+            print(f"[ERROR] 400 Bad Request. Response body: {response.text}")
+            response.raise_for_status()
+
+        response.raise_for_status()
+    return response
 
 
-# --------------------------
-# NORMALIZE
-# --------------------------
-def normalize_profile(record: Dict) -> Dict:
-    attributes = record.get("attributes", {}) or {}
-    relationships = record.get("relationships", {}) or {}
-    properties = attributes.get("properties", {}) or {}
-    return {
-        "ID": record.get("id"),
-        "TYPE": record.get("type"),
-        "EMAIL": attributes.get("email"),
-        "EXTERNAL_ID": attributes.get("external_id"),
-        "UPDATED": attributes.get("updated"),
-        "DATE_OF_BIRTH": properties.get("Date_of_Birth"),
-        "LAST_FEMALE_CYCLE_STATUS": properties.get("Last_Female_Cycle_Status"),
-        "ATTRIBUTES": attributes,
-        "PROPERTIES": properties,
-        "RELATIONSHIPS": relationships,
-        "LINKS": record.get("links", {}) or {},
-        "SEGMENTS": relationships.get("segments", {}) or {},
-    }
+def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[str, Any]) -> str:
+    key = f"{prefix}/page_{page_index}.json"
+    body = json.dumps(payload).encode("utf-8")
+    _s3_client.put_object(Bucket=bucket_name, Key=key, Body=body)
+    return key
 
 
-# --------------------------
-# MAIN
-# --------------------------
-def main():
-    PAGE_SIZE = 100
+def add_custom_columns(payload: Dict[str, Any]) -> None:
+    """
+    Surface select Klaviyo profile properties as first-class columns.
+    """
+    records = payload.get("data")
+    if not isinstance(records, list):
+        return
 
-    session = make_session()
-    conn = get_snowflake_connection()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
 
+        attributes = record.get("attributes") or {}
+        properties = attributes.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
+
+        for column_name, property_key in CUSTOM_PROFILE_PROPERTIES.items():
+            record[column_name] = properties.get(property_key)
+
+
+def fetch_profiles_to_s3(bucket_name: str, prefix: str) -> Dict[str, Any]:
+    api_key = os.environ.get("KLAVIYO_API_KEY")
+    if not api_key:
+        raise ValueError("Missing KLAVIYO_API_KEY environment variable")
+
+    session = make_session(api_key.strip())
     url = "https://a.klaviyo.com/api/profiles/"
-    params = {
+    params: Dict[str, Any] = {
         "page[size]": str(PAGE_SIZE),
         "sort": "updated",
         "fields[profile]": "email,external_id,properties,updated,created,subscriptions",
     }
 
-    buffer: List[Dict] = []
-    seen_ids: set = set()
-    total_inserted = 0
+    pages_saved = 0
+    page_index = 1
 
-    try:
-        while True:
-            resp = safe_get(session, url, params=params, timeout=(10, 180))
-            payload = resp.json()
-            data = payload.get("data", []) or []
+    while True:
+        response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
+        payload = response.json()
+        add_custom_columns(payload)
 
-            if not data:
-                print("[INFO] No more profiles; finishing.")
-                break
+        data = payload.get("data") or []
+        if not data:
+            print("[INFO] No more profiles; finishing pagination.")
+            break
 
-            for item in data:
-                rec = normalize_profile(item)
-                pid = rec.get("ID")
-                if not pid or pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-                buffer.append(rec)
+        key = save_payload(bucket_name, prefix, page_index, payload)
+        print(f"[INFO] Saved page {page_index} ({len(data)} profiles) to s3://{bucket_name}/{key}")
+        pages_saved += 1
 
-                if len(buffer) >= BATCH_SIZE:
-                    inserted = write_profiles_batch_to_snowflake(conn, buffer)
-                    total_inserted += inserted
-                    print(f"[INFO] Batch inserted {inserted} (total={total_inserted})")
-                    buffer.clear()
-                    
+        next_url = (payload.get("links") or {}).get("next")
+        if not next_url:
+            break
 
-            next_url = (payload.get("links") or {}).get("next")
-            if not next_url:
-                break
-            url, params = next_url, None
+        url, params = next_url, None
+        page_index += 1
 
-        if buffer:
-            inserted = write_profiles_batch_to_snowflake(conn, buffer)
-            total_inserted += inserted
-            print(f"[INFO] Final batch inserted {inserted}")
+    return {
+        "pages_saved": pages_saved,
+        "s3_prefix": f"s3://{bucket_name}/{prefix}/"
+    }
 
-        print(f"[DONE] Inserted total {total_inserted} rows")
 
-    finally:
-        conn.close()
+def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
+    event = event or {}
+
+    bucket_name = event.get("bucket") or os.environ.get("KLAVIYO_PROFILES_BUCKET")
+    if not bucket_name:
+        raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
+
+    prefix = (
+        event.get("prefix")
+        or os.environ.get("KLAVIYO_PROFILES_PREFIX")
+        or f"profiles/{time.strftime('%Y-%m-%d')}"
+    )
+
+    return fetch_profiles_to_s3(bucket_name, prefix)
 
 
 if __name__ == "__main__":
-    main()
+    result = handler()
+    print(f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}")
