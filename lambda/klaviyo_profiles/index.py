@@ -193,18 +193,14 @@ def fetch_profiles_to_s3(
 def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
     event = event or {}
 
-    bucket_name = event.get("bucket") or os.environ.get("KLAVIYO_PROFILES_BUCKET")
+    bucket_name = os.environ.get("KLAVIYO_PROFILES_BUCKET")
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
 
-    prefix = (
-        event.get("prefix")
-        or os.environ.get("KLAVIYO_PROFILES_PREFIX")
-        or f"profiles/{time.strftime('%Y-%m-%d')}"
-    )
+    prefix = ("{time.strftime('%Y-%m-%d')}")
 
-    secret_name = event.get("secret_name") or SECRET_NAME
-    secret_key = event.get("secret_key") or SECRET_KEY_NAME
+    secret_name = SECRET_NAME
+    secret_key = SECRET_KEY_NAME
 
     return fetch_profiles_to_s3(bucket_name, prefix, secret_name, secret_key)
 
