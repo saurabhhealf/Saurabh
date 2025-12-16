@@ -110,8 +110,10 @@ def safe_get(session: requests.Session,
             print(f"[ERROR] 400 Bad Request. Response body: {response.text}")
             response.raise_for_status()
 
+        # success or other non-retryable 4xx (e.g., 401/403)
         response.raise_for_status()
-    return response
+        return response
+
 
 
 def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[str, Any]) -> str:
@@ -157,7 +159,7 @@ def fetch_profiles_to_s3(
     params: Dict[str, Any] = {
         "page[size]": str(PAGE_SIZE),
         "sort": "updated",
-        "fields[profile]": "email,external_id,properties,updated,created,subscriptions",
+        "additional-fields[profile]": "subscriptions",
     }
 
     pages_saved = 0
@@ -197,7 +199,8 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
 
-    prefix = ("{time.strftime('%Y-%m-%d')}")
+    prefix = f"profiles/{time.strftime('%Y-%m-%d')}"
+
 
     secret_name = SECRET_NAME
     secret_key = SECRET_KEY_NAME
