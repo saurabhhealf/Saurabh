@@ -34,7 +34,7 @@ events_lambda = aws.lambda_.Function(
     runtime="python3.13",
     handler="index.handler",
     code=pulumi.AssetArchive({
-        ".": pulumi.FileArchive("./lambda")
+        ".": pulumi.FileArchive("./lambda/klaviyo_events")
     }),
     timeout=600,
     environment=aws.lambda_.FunctionEnvironmentArgs(
@@ -62,7 +62,7 @@ profiles_lambda = aws.lambda_.Function(
     runtime="python3.13",
     handler="index.handler",
     code=pulumi.AssetArchive({
-        ".": pulumi.FileArchive("./lambda_profiles")
+        ".": pulumi.FileArchive("./lambda/klaviyo_profiles")
     }),
     timeout=600,
     environment=aws.lambda_.FunctionEnvironmentArgs(
