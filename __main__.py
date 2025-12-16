@@ -27,6 +27,20 @@ requests_layer = aws.lambda_.LayerVersion(
     }),
 )
 
+secrets_read_policy = """{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+            ],
+            "Resource": "arn:aws:secretsmanager:*:*:secret:klaviyo*"
+        }
+    ]
+}"""
+
 # Events resources
 events_bucket = aws.s3.Bucket("klaviyo-events-bucket")
 
@@ -36,6 +50,12 @@ aws.iam.RolePolicyAttachment(
     "eventsLambdaPolicy",
     role=events_role.id,
     policy_arn="arn:aws:iam::aws:policy/AWSLambdaExecute",
+)
+
+aws.iam.RolePolicy(
+    "eventsSecretsAccess",
+    role=events_role.id,
+    policy=secrets_read_policy,
 )
 
 events_lambda = aws.lambda_.Function(
@@ -64,6 +84,12 @@ aws.iam.RolePolicyAttachment(
     "profilesLambdaPolicy",
     role=profiles_role.id,
     policy_arn="arn:aws:iam::aws:policy/AWSLambdaExecute",
+)
+
+aws.iam.RolePolicy(
+    "profilesSecretsAccess",
+    role=profiles_role.id,
+    policy=secrets_read_policy,
 )
 
 profiles_lambda = aws.lambda_.Function(
