@@ -16,6 +16,17 @@ assume_role_policy = """{
     ]
 }"""
 
+# Shared Lambda layer for third-party dependencies (requests)
+requests_layer = aws.lambda_.LayerVersion(
+    "requestsLayer",
+    layer_name="requests_layer",
+    compatible_runtimes=["python3.13"],
+    compatible_architectures=["x86_64"],
+    code=pulumi.AssetArchive({
+        ".": pulumi.FileArchive("./lambda/layers/requests")
+    }),
+)
+
 # Events resources
 events_bucket = aws.s3.Bucket("klaviyo-events-bucket")
 
@@ -36,6 +47,7 @@ events_lambda = aws.lambda_.Function(
         ".": pulumi.FileArchive("./lambda/klaviyo_events")
     }),
     timeout=600,
+    layers=[requests_layer.arn],
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_EVENTS_BUCKET": events_bucket.bucket,
@@ -63,6 +75,7 @@ profiles_lambda = aws.lambda_.Function(
         ".": pulumi.FileArchive("./lambda/klaviyo_profiles")
     }),
     timeout=600,
+    layers=[requests_layer.arn],
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
