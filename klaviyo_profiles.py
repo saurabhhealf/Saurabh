@@ -4,12 +4,12 @@ Fetch Klaviyo profiles and write each page to S3.
 
 - No Snowflake writes; raw payload per page.
 - No incremental window or deduping; downstream tooling handles that.
-- Relies on env vars (e.g., GitHub Secrets) for configuration:
-    * KLAVIYO_API_KEY
+- Relies on AWS Secrets Manager for the Klaviyo API key plus env vars for:
     * KLAVIYO_PROFILES_BUCKET
     * KLAVIYO_PROFILES_PREFIX (optional; defaults to profiles/YYYY-MM-DD)
 """
 
+import base64
 import json
 import os
 import random
@@ -26,8 +26,37 @@ CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
 }
+SECRET_NAME = "klaviyo"
+SECRET_KEY_NAME = "API_KEY"
 
+_secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
+
+
+def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
+    """Fetch the Klaviyo API key from AWS Secrets Manager."""
+    resp = _secrets_client.get_secret_value(SecretId=secret_name)
+    secret = resp.get("SecretString")
+    if secret is None:
+        binary_secret = resp.get("SecretBinary")
+        if binary_secret is None:
+            raise ValueError(f"Secret {secret_name} has no payload")
+        secret = base64.b64decode(binary_secret).decode("utf-8")
+
+    try:
+        parsed = json.loads(secret)
+        if isinstance(parsed, dict):
+            api_key = (
+                parsed.get(key_name)
+                or parsed.get("api_key")
+                or parsed.get("KLAVIYO_API_KEY")
+            )
+            if api_key:
+                return api_key
+    except json.JSONDecodeError:
+        pass
+
+    return secret
 
 
 def make_session(api_key: str, pool_maxsize: int = 20) -> requests.Session:
@@ -113,12 +142,17 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
             record[column_name] = properties.get(property_key)
 
 
-def fetch_profiles_to_s3(bucket_name: str, prefix: str) -> Dict[str, Any]:
-    api_key = os.environ.get("KLAVIYO_API_KEY")
+def fetch_profiles_to_s3(
+    bucket_name: str,
+    prefix: str,
+    secret_name: str = SECRET_NAME,
+    secret_key: str = SECRET_KEY_NAME,
+) -> Dict[str, Any]:
+    api_key = get_api_key(secret_name, secret_key).strip()
     if not api_key:
-        raise ValueError("Missing KLAVIYO_API_KEY environment variable")
+        raise ValueError(f"Secret {secret_name} did not return an API key")
 
-    session = make_session(api_key.strip())
+    session = make_session(api_key)
     url = "https://a.klaviyo.com/api/profiles/"
     params: Dict[str, Any] = {
         "page[size]": str(PAGE_SIZE),
@@ -169,7 +203,10 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
         or f"profiles/{time.strftime('%Y-%m-%d')}"
     )
 
-    return fetch_profiles_to_s3(bucket_name, prefix)
+    secret_name = event.get("secret_name") or SECRET_NAME
+    secret_key = event.get("secret_key") or SECRET_KEY_NAME
+
+    return fetch_profiles_to_s3(bucket_name, prefix, secret_name, secret_key)
 
 
 if __name__ == "__main__":

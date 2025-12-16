@@ -14,6 +14,7 @@ import random
 import base64
 from typing import Dict, List, Tuple
 
+import boto3
 import requests
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
@@ -24,9 +25,45 @@ load_dotenv()
 # --------------------------
 # CONFIG
 # --------------------------
-API_KEY = os.environ.get("KLAVIYO_API_KEY")
+SECRET_NAME = "klaviyo"
+SECRET_KEY_NAME = "API_KEY"
+
+_secrets_client = boto3.client("secretsmanager")
+
+
+def get_klaviyo_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
+    """Load the Klaviyo API key from AWS Secrets Manager."""
+    try:
+        resp = _secrets_client.get_secret_value(SecretId=secret_name)
+    except _secrets_client.exceptions.ResourceNotFoundException as exc:
+        raise ValueError(f"Secret {secret_name} not found") from exc
+
+    secret = resp.get("SecretString")
+    if secret is None:
+        binary_secret = resp.get("SecretBinary")
+        if binary_secret is None:
+            raise ValueError(f"Secret {secret_name} has no payload")
+        secret = base64.b64decode(binary_secret).decode("utf-8")
+
+    try:
+        parsed = json.loads(secret)
+        if isinstance(parsed, dict):
+            api_key = (
+                parsed.get(key_name)
+                or parsed.get("api_key")
+                or parsed.get("KLAVIYO_API_KEY")
+            )
+            if api_key:
+                return api_key
+    except json.JSONDecodeError:
+        pass
+
+    return secret
+
+
+API_KEY = get_klaviyo_api_key().strip()
 if not API_KEY:
-    print("[ERROR] KLAVIYO_API_KEY env var is missing")
+    print(f"[ERROR] Secret {SECRET_NAME} did not return an API key")
     sys.exit(1)
 
 API_REVISION = "2025-10-15"  # Klaviyo API revision

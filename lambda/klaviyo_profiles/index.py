@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+Fetch Klaviyo profiles and write each page to S3.
+
+- No Snowflake writes; raw payload per page.
+- No incremental window or deduping; downstream tooling handles that.
+- Relies on AWS Secrets Manager for the Klaviyo API key plus env vars for:
+    * KLAVIYO_PROFILES_BUCKET
+    * KLAVIYO_PROFILES_PREFIX (optional; defaults to profiles/YYYY-MM-DD)
+"""
+
 import base64
 import json
 import os
@@ -11,12 +22,19 @@ import requests
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
 REQUEST_TIMEOUT = (10, 180)
+CUSTOM_PROFILE_PROPERTIES = {
+    "DATE_OF_BIRTH": "Date_of_Birth",
+    "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
+}
+SECRET_NAME = "klaviyo"
+SECRET_KEY_NAME = "API_KEY"
 
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
 
 
-def get_api_key(secret_name: str) -> str:
+def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
+    """Fetch the Klaviyo API key from AWS Secrets Manager."""
     resp = _secrets_client.get_secret_value(SecretId=secret_name)
     secret = resp.get("SecretString")
     if secret is None:
@@ -28,7 +46,13 @@ def get_api_key(secret_name: str) -> str:
     try:
         parsed = json.loads(secret)
         if isinstance(parsed, dict):
-            return parsed.get("api_key") or parsed.get("KLAVIYO_API_KEY") or secret
+            api_key = (
+                parsed.get(key_name)
+                or parsed.get("api_key")
+                or parsed.get("KLAVIYO_API_KEY")
+            )
+            if api_key:
+                return api_key
     except json.JSONDecodeError:
         pass
 
@@ -87,7 +111,7 @@ def safe_get(session: requests.Session,
             response.raise_for_status()
 
         response.raise_for_status()
-        return response
+    return response
 
 
 def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[str, Any]) -> str:
@@ -97,24 +121,34 @@ def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[s
     return key
 
 
-def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
-    event = event or {}
+def add_custom_columns(payload: Dict[str, Any]) -> None:
+    """
+    Surface select Klaviyo profile properties as first-class columns.
+    """
+    records = payload.get("data")
+    if not isinstance(records, list):
+        return
 
-    bucket_name = event.get("bucket") or os.environ.get("KLAVIYO_PROFILES_BUCKET")
-    if not bucket_name:
-        raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
+    for record in records:
+        if not isinstance(record, dict):
+            continue
 
-    secret_name = event.get("secret_name") or os.environ.get("KLAVIYO_API_SECRET_NAME")
-    if not secret_name:
-        raise ValueError("Missing KLAVIYO_API_SECRET_NAME environment variable")
+        attributes = record.get("attributes") or {}
+        properties = attributes.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
 
-    prefix = (
-        event.get("prefix")
-        or os.environ.get("KLAVIYO_PROFILES_PREFIX")
-        or f"profiles/{time.strftime('%Y-%m-%d')}"
-    )
+        for column_name, property_key in CUSTOM_PROFILE_PROPERTIES.items():
+            record[column_name] = properties.get(property_key)
 
-    api_key = get_api_key(secret_name).strip()
+
+def fetch_profiles_to_s3(
+    bucket_name: str,
+    prefix: str,
+    secret_name: str = SECRET_NAME,
+    secret_key: str = SECRET_KEY_NAME,
+) -> Dict[str, Any]:
+    api_key = get_api_key(secret_name, secret_key).strip()
     if not api_key:
         raise ValueError(f"Secret {secret_name} did not return an API key")
 
@@ -132,6 +166,7 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
     while True:
         response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
         payload = response.json()
+        add_custom_columns(payload)
 
         data = payload.get("data") or []
         if not data:
@@ -151,14 +186,29 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
 
     return {
         "pages_saved": pages_saved,
-        "s3_prefix": f"s3://{bucket_name}/{prefix}/",
+        "s3_prefix": f"s3://{bucket_name}/{prefix}/"
     }
 
 
-def main():
-    result = handler({}, None)
-    print(json.dumps(result, indent=2))
+def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
+    event = event or {}
+
+    bucket_name = event.get("bucket") or os.environ.get("KLAVIYO_PROFILES_BUCKET")
+    if not bucket_name:
+        raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
+
+    prefix = (
+        event.get("prefix")
+        or os.environ.get("KLAVIYO_PROFILES_PREFIX")
+        or f"profiles/{time.strftime('%Y-%m-%d')}"
+    )
+
+    secret_name = event.get("secret_name") or SECRET_NAME
+    secret_key = event.get("secret_key") or SECRET_KEY_NAME
+
+    return fetch_profiles_to_s3(bucket_name, prefix, secret_name, secret_key)
 
 
 if __name__ == "__main__":
-    main()
+    result = handler()
+    print(f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}")

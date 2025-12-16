@@ -2,7 +2,6 @@ import pulumi
 import pulumi_aws as aws
 
 config = pulumi.Config()
-klaviyo_api_secret_name = config.require("klaviyoApiSecretName")
 
 assume_role_policy = """{
     "Version": "2012-10-17",
@@ -40,7 +39,6 @@ events_lambda = aws.lambda_.Function(
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_EVENTS_BUCKET": events_bucket.bucket,
-            "KLAVIYO_API_SECRET_NAME": klaviyo_api_secret_name,
         }
     ),
 )
@@ -68,7 +66,6 @@ profiles_lambda = aws.lambda_.Function(
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
-            "KLAVIYO_API_SECRET_NAME": klaviyo_api_secret_name,
         }
     ),
 )

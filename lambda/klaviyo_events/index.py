@@ -11,12 +11,14 @@ import requests
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 200
 REQUEST_TIMEOUT = (10, 180)
+SECRET_NAME = "klaviyo"
+SECRET_KEY_NAME = "API_KEY"
 
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
 
 
-def get_api_key(secret_name: str) -> str:
+def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
     """Pull the Klaviyo API key from AWS Secrets Manager."""
     resp = _secrets_client.get_secret_value(SecretId=secret_name)
     secret = resp.get("SecretString")
@@ -30,7 +32,13 @@ def get_api_key(secret_name: str) -> str:
         parsed = json.loads(secret)
         if isinstance(parsed, dict):
             # Handle both {"api_key": "..."} and {"KLAVIYO_API_KEY": "..."}
-            return parsed.get("api_key") or parsed.get("KLAVIYO_API_KEY") or secret
+            api_key = (
+                parsed.get(key_name)
+                or parsed.get("api_key")
+                or parsed.get("KLAVIYO_API_KEY")
+            )
+            if api_key:
+                return api_key
     except json.JSONDecodeError:
         pass
 
@@ -128,9 +136,8 @@ def handler(event: Dict[str, Any], _context) -> Dict[str, Any]:
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_EVENTS_BUCKET environment variable")
 
-    secret_name = os.environ.get("KLAVIYO_API_SECRET_NAME")
-    if not secret_name:
-        raise ValueError("Missing KLAVIYO_API_SECRET_NAME environment variable")
+    secret_name = extract_event_value(event, "secret_name") or SECRET_NAME
+    secret_key = extract_event_value(event, "secret_key") or SECRET_KEY_NAME
 
     start_datetime = extract_event_value(event, "start_datetime")
     if not start_datetime:
@@ -139,7 +146,7 @@ def handler(event: Dict[str, Any], _context) -> Dict[str, Any]:
     end_datetime = extract_event_value(event, "end_datetime")
     date_prefix = start_datetime.split("T")[0]
 
-    api_key = get_api_key(secret_name).strip()
+    api_key = get_api_key(secret_name, secret_key).strip()
     if not api_key:
         raise ValueError(f"Secret {secret_name} did not return an API key")
 
