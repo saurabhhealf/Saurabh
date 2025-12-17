@@ -12,10 +12,10 @@ import requests
 # --- Configuration ---
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-MAX_PAGES_PER_RUN = 50  # Lambda restarts itself after 50 pages
+MAX_PAGES_PER_RUN = 50  # Stop after 50 pages and restart to prevent timeout
 REQUEST_TIMEOUT = (10, 60)
 
-# Custom fields to flatten (optional, but good for analysis)
+# Custom fields to flatten
 CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
@@ -112,7 +112,7 @@ def save_payload(bucket: str, key: str, data: Dict) -> None:
 
 def invoke_next_lambda(function_name: str, next_url: str, next_page_index: int, run_id: str):
     """
-    Triggers the next batch asynchronously.
+    Trigger the SAME Lambda asynchronously to continue the job.
     """
     payload = {
         "next_url": next_url,
@@ -122,26 +122,24 @@ def invoke_next_lambda(function_name: str, next_url: str, next_page_index: int, 
     print(f"[RECURSION] Invoking self for page {next_page_index}...")
     _lambda_client.invoke(
         FunctionName=function_name,
-        InvocationType='Event',  # Asynchronous (Fire & Forget)
+        InvocationType='Event',  # Asynchronous - fire and forget
         Payload=json.dumps(payload)
     )
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # 1. Setup Context (New Run vs Continuation)
+    # 1. Setup Context
     run_id = event.get("run_id")
     if not run_id:
-        # Create a unique ID for this full dump (e.g., "full_dump_2025-12-17_093000")
-        run_id = datetime.utcnow().strftime("full_dump_%Y-%m-%d_%H%M%S")
+        # UPDATED: Name is just UTC timestamp now (e.g. "2025-12-17_14-30-00")
+        run_id = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
         print(f"[START] Starting NEW full profile dump. Run ID: {run_id}")
 
     # 2. Determine Start Position
-    # If we have a 'next_url', we use it. If not, we start from the beginning.
     url = event.get("next_url") or "https://a.klaviyo.com/api/profiles/"
     page_index = event.get("page_index") or 1
     
-    # Params are only needed for the very first call. 
-    # Subsequent 'next' links from Klaviyo already include encoded params.
+    # Params are only needed for the very first call.
     params = None
     if not event.get("next_url"):
         params = {
@@ -155,9 +153,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         raise ValueError("Environment variable KLAVIYO_PROFILES_BUCKET is missing.")
         
     api_key = get_api_key()
-    if not api_key:
-        raise ValueError("API Key not found.")
-        
     session = make_session(api_key)
     pages_processed_this_run = 0
 
@@ -165,40 +160,39 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     # 4. Processing Loop
     while True:
-        # A. Safety Check: Restart Lambda if we hit the batch limit
+        # Check Limits
         if pages_processed_this_run >= MAX_PAGES_PER_RUN:
             print(f"[LIMIT] Reached {MAX_PAGES_PER_RUN} pages. Recursing...")
             invoke_next_lambda(context.function_name, url, page_index, run_id)
             return {"status": "continued", "next_page": page_index}
 
-        # B. Fetch Data
+        # Fetch
         response = safe_get(session, url, params=params)
         payload = response.json()
         
-        # C. Process Data (Flatten columns)
+        # Flatten
         add_custom_columns(payload)
         data = payload.get("data") or []
 
         if not data:
-            print("[FINISH] No more data returned by API. Job complete.")
+            print("[FINISH] No more data returned. Job complete.")
             break
 
-        # D. Save to S3
+        # Save
         s3_key = f"profiles/{run_id}/page_{page_index}.json"
         save_payload(BUCKET_NAME, s3_key, payload)
         print(f"[SAVE] Saved {len(data)} profiles to {s3_key}")
 
-        # E. Advance Pointers
+        # Advance
         pages_processed_this_run += 1
         page_index += 1
         
-        # F. Get Next Link
+        # Next Link
         next_link = (payload.get("links") or {}).get("next")
         if not next_link:
             print("[FINISH] No 'next' link provided. Job complete.")
             break
         
-        # Update URL for next loop (params are inside the link now)
         url = next_link
         params = None 
 
