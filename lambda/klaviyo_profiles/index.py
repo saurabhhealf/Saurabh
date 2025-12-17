@@ -134,11 +134,11 @@ def parse_klaviyo_date(date_str: str) -> datetime:
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # 1. Define Window: Last 3 Hours
+    # 1. Define Window: Last 1 Hours
     end_ts = datetime.now(timezone.utc)
     
     # --- CHANGED HERE ---
-    start_ts = end_ts - timedelta(hours=6) 
+    start_ts = end_ts - timedelta(hours=1) 
     # --------------------
 
     run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
