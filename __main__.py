@@ -88,10 +88,22 @@ aws.iam.RolePolicyAttachment(
     policy_arn="arn:aws:iam::aws:policy/AWSLambdaExecute",
 )
 
+aws.iam.RolePolicyAttachment(
+    "profilesLambdaSqsAccess",
+    role=profiles_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+)
+
 aws.iam.RolePolicy(
     "profilesSecretsAccess",
     role=profiles_role.id,
     policy=secrets_read_policy,
+)
+
+profiles_queue = aws.sqs.Queue(
+    "klaviyoProfilesQueue",
+    visibility_timeout_seconds=120,
+    message_retention_seconds=1209600,
 )
 
 profiles_lambda = aws.lambda_.Function(
@@ -107,21 +119,29 @@ profiles_lambda = aws.lambda_.Function(
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
+            "KLAVIYO_PROFILES_QUEUE_URL": profiles_queue.url,
         }
     ),
 )
 
+aws.lambda_.EventSourceMapping(
+    "profilesQueueMapping",
+    event_source_arn=profiles_queue.arn,
+    function_name=profiles_lambda.arn,
+    batch_size=1,
+)
+
 aws.iam.RolePolicy(
-    "profilesSelfInvoke",
+    "profilesQueueSendAccess",
     role=profiles_role.id,
-    policy=profiles_lambda.arn.apply(
+    policy=profiles_queue.arn.apply(
         lambda arn: json.dumps({
             "Version": "2012-10-17",
             "Statement": [
                 {
                     "Effect": "Allow",
-                    "Action": "lambda:InvokeFunction",
-                    "Resource": [arn, f"{arn}:*"],
+                    "Action": "sqs:SendMessage",
+                    "Resource": arn,
                 }
             ],
         })
