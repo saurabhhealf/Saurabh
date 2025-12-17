@@ -1,3 +1,14 @@
+#!/usr/bin/env python3
+"""
+Fetch Klaviyo profiles and write each page to S3.
+
+- No Snowflake writes; raw payload per page.
+- No incremental window or deduping; downstream tooling handles that.
+- Relies on AWS Secrets Manager for the Klaviyo API key plus env vars for:
+    * KLAVIYO_PROFILES_BUCKET
+    * KLAVIYO_PROFILES_PREFIX (optional; defaults to profiles/YYYY-MM-DD)
+"""
+
 import base64
 import json
 import os
@@ -10,7 +21,7 @@ import requests
 
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-REQUEST_TIMEOUT = (10, 60)  # consider shorter now that each run is small
+REQUEST_TIMEOUT = (10, 180)
 CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
@@ -23,6 +34,7 @@ _s3_client = boto3.client("s3")
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
+    """Fetch the Klaviyo API key from AWS Secrets Manager."""
     resp = _secrets_client.get_secret_value(SecretId=secret_name)
     secret = resp.get("SecretString")
     if secret is None:
@@ -64,13 +76,11 @@ def make_session(api_key: str, pool_maxsize: int = 20) -> requests.Session:
     return session
 
 
-def safe_get(
-    session: requests.Session,
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    max_retries: int = 4,
-    timeout: tuple = (10, 60),
-) -> requests.Response:
+def safe_get(session: requests.Session,
+             url: str,
+             params: Optional[Dict[str, Any]] = None,
+             max_retries: int = 7,
+             timeout: tuple = (10, 150)) -> requests.Response:
     attempt = 0
     while True:
         try:
@@ -82,7 +92,7 @@ def safe_get(
             attempt += 1
             if attempt > max_retries:
                 raise
-            sleep_seconds = min(2 ** attempt, 30) + random.uniform(0, 1)
+            sleep_seconds = min(2 ** attempt, 60) + random.uniform(0, 1)
             print(f"[WARN] Network issue: {exc}. Retrying in {sleep_seconds:.1f}s")
             time.sleep(sleep_seconds)
             continue
@@ -91,7 +101,7 @@ def safe_get(
             attempt += 1
             if attempt > max_retries:
                 response.raise_for_status()
-            sleep_seconds = min(2 ** attempt, 30) + random.uniform(0, 1)
+            sleep_seconds = min(2 ** attempt, 60) + random.uniform(0, 1)
             print(f"[WARN] HTTP {response.status_code}. Retrying in {sleep_seconds:.1f}s")
             time.sleep(sleep_seconds)
             continue
@@ -100,8 +110,10 @@ def safe_get(
             print(f"[ERROR] 400 Bad Request. Response body: {response.text}")
             response.raise_for_status()
 
+        # success or other non-retryable 4xx (e.g., 401/403)
         response.raise_for_status()
         return response
+
 
 
 def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[str, Any]) -> str:
@@ -112,6 +124,9 @@ def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[s
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
+    """
+    Surface select Klaviyo profile properties as first-class columns.
+    """
     records = payload.get("data")
     if not isinstance(records, list):
         return
@@ -129,6 +144,54 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
             record[column_name] = properties.get(property_key)
 
 
+def fetch_profiles_to_s3(
+    bucket_name: str,
+    prefix: str,
+    secret_name: str = SECRET_NAME,
+    secret_key: str = SECRET_KEY_NAME,
+) -> Dict[str, Any]:
+    api_key = get_api_key(secret_name, secret_key).strip()
+    if not api_key:
+        raise ValueError(f"Secret {secret_name} did not return an API key")
+
+    session = make_session(api_key)
+    url = "https://a.klaviyo.com/api/profiles/"
+    params: Dict[str, Any] = {
+        "page[size]": str(PAGE_SIZE),
+        "sort": "updated",
+        "additional-fields[profile]": "subscriptions",
+    }
+
+    pages_saved = 0
+    page_index = 1
+
+    while True:
+        response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
+        payload = response.json()
+        add_custom_columns(payload)
+
+        data = payload.get("data") or []
+        if not data:
+            print("[INFO] No more profiles; finishing pagination.")
+            break
+
+        key = save_payload(bucket_name, prefix, page_index, payload)
+        print(f"[INFO] Saved page {page_index} ({len(data)} profiles) to s3://{bucket_name}/{key}")
+        pages_saved += 1
+
+        next_url = (payload.get("links") or {}).get("next")
+        if not next_url:
+            break
+
+        url, params = next_url, None
+        page_index += 1
+
+    return {
+        "pages_saved": pages_saved,
+        "s3_prefix": f"s3://{bucket_name}/{prefix}/"
+    }
+
+
 def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
     event = event or {}
 
@@ -138,53 +201,13 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
 
     prefix = f"profiles/{time.strftime('%Y-%m-%d')}"
 
-    api_key = get_api_key(SECRET_NAME, SECRET_KEY_NAME).strip()
-    if not api_key:
-        raise ValueError(f"Secret {SECRET_NAME} did not return an API key")
 
-    session = make_session(api_key)
+    secret_name = SECRET_NAME
+    secret_key = SECRET_KEY_NAME
 
-    # If we were given a next_url, continue from there; otherwise start from scratch
-    url = event.get("next_url") or "https://a.klaviyo.com/api/profiles/"
-    params: Optional[Dict[str, Any]]
-    if event.get("next_url"):
-        params = None  # Klaviyo next link is already fully formed
-    else:
-        params = {
-            "page[size]": str(PAGE_SIZE),
-            "sort": "updated",
-            "additional-fields[profile]": "subscriptions",
-        }
-
-    page_index = int(event.get("page_index", 1))
-
-    response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
-    payload = response.json()
-    add_custom_columns(payload)
-
-    data = payload.get("data") or []
-    if not data:
-        print("[INFO] No more profiles on this page; finishing.")
-        return {
-            "done": True,
-            "pages_saved": 0,
-            "s3_prefix": f"s3://{bucket_name}/{prefix}/",
-        }
-
-    key = save_payload(bucket_name, prefix, page_index, payload)
-    print(f"[INFO] Saved page {page_index} ({len(data)} profiles) to s3://{bucket_name}/{key}")
-
-    next_url = (payload.get("links") or {}).get("next")
-
-    return {
-        "done": not bool(next_url),
-        "next_url": next_url,
-        "page_index": page_index + 1,
-        "pages_saved": 1,
-        "s3_prefix": f"s3://{bucket_name}/{prefix}/",
-    }
+    return fetch_profiles_to_s3(bucket_name, prefix, secret_name, secret_key)
 
 
 if __name__ == "__main__":
     result = handler()
-    print(f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}, done={result['done']}")
+    print(f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}")
