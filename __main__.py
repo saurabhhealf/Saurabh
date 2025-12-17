@@ -102,7 +102,7 @@ aws.iam.RolePolicy(
 
 profiles_queue = aws.sqs.Queue(
     "klaviyoProfilesQueue",
-    visibility_timeout_seconds=120,
+    visibility_timeout_seconds=900,
     message_retention_seconds=1209600,
 )
 
