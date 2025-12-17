@@ -10,7 +10,7 @@ import requests
 
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-REQUEST_TIMEOUT = (10, 60)  # consider shorter now that each run is small
+REQUEST_TIMEOUT = (10, 60)
 CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
@@ -136,20 +136,23 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
 
-    prefix = f"profiles/{time.strftime('%Y-%m-%d')}"
+    # Use a fixed run_date for a whole export, so later invocations
+    # for the same run keep writing into the same prefix.
+    run_date = event.get("run_date") or time.strftime("%Y-%m-%d")
+    prefix = f"profiles/{run_date}"
 
     api_key = get_api_key(SECRET_NAME, SECRET_KEY_NAME).strip()
     if not api_key:
         raise ValueError(f"Secret {SECRET_NAME} did not return an API key")
-
     session = make_session(api_key)
 
     # If we were given a next_url, continue from there; otherwise start from scratch
-    url = event.get("next_url") or "https://a.klaviyo.com/api/profiles/"
-    params: Optional[Dict[str, Any]]
-    if event.get("next_url"):
-        params = None  # Klaviyo next link is already fully formed
+    url_from_event = event.get("next_url")
+    if url_from_event:
+        url = url_from_event
+        params: Optional[Dict[str, Any]] = None  # next links are fully-formed
     else:
+        url = "https://a.klaviyo.com/api/profiles/"
         params = {
             "page[size]": str(PAGE_SIZE),
             "sort": "updated",
@@ -158,16 +161,20 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
 
     page_index = int(event.get("page_index", 1))
 
+    # 👉 EXACTLY ONE REQUEST = ONE PAGE
     response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
     payload = response.json()
     add_custom_columns(payload)
 
     data = payload.get("data") or []
     if not data:
-        print("[INFO] No more profiles on this page; finishing.")
+        print("[INFO] No more profiles; finishing.")
         return {
             "done": True,
+            "next_url": None,
+            "page_index": page_index,
             "pages_saved": 0,
+            "run_date": run_date,
             "s3_prefix": f"s3://{bucket_name}/{prefix}/",
         }
 
@@ -181,10 +188,14 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
         "next_url": next_url,
         "page_index": page_index + 1,
         "pages_saved": 1,
+        "run_date": run_date,
         "s3_prefix": f"s3://{bucket_name}/{prefix}/",
     }
 
 
 if __name__ == "__main__":
     result = handler()
-    print(f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}, done={result['done']}")
+    print(
+        f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}, "
+        f"page_index={result['page_index']}, done={result['done']}"
+    )
