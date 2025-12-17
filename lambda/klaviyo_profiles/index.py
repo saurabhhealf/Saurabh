@@ -134,13 +134,13 @@ def parse_klaviyo_date(date_str: str) -> datetime:
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # 1. Define "Last Minute" Window
-    # End = Now (UTC)
-    # Start = Now - 1 Minute
+    # 1. Define Window: Last 3 Hours
     end_ts = datetime.now(timezone.utc)
-    start_ts = end_ts - timedelta(minutes=1)
     
-    # Run ID is simply the current timestamp
+    # --- CHANGED HERE ---
+    start_ts = end_ts - timedelta(hours=3) 
+    # --------------------
+
     run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
     
     print(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
@@ -156,13 +156,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     url = "https://a.klaviyo.com/api/profiles/"
     params = {
         "page[size]": str(PAGE_SIZE),
-        "sort": "-updated", # Newest first is critical
-        "additional-fields[profile]": "subscriptions" # This is safe for rate limits
+        "sort": "-updated", # Newest first
+        "additional-fields[profile]": "subscriptions"
     }
 
     page_index = 1
     total_profiles_saved = 0
     stop_fetching = False
+    
+    # Increase safety limit for 3 hours of data (e.g. 1000 pages = 100,000 profiles)
+    MAX_PAGES_SAFETY_LIMIT = 1000 
 
     # 3. Processing Loop
     while True:
@@ -193,21 +196,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except ValueError:
                 continue
 
-            # Skip future records (clock skew safety)
             if record_dt > end_ts:
                 continue
 
-            # STOP if older than 1 minute
+            # STOP if older than 3 hours
             if record_dt < start_ts:
                 stop_fetching = True
                 break
             
-            # Keep record
             valid_records.append(record)
 
         # 5. Save Valid Records
         if valid_records:
-            # Only save the filtered list
             payload["data"] = valid_records
             if "links" in payload: del payload["links"] 
             
@@ -219,7 +219,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             print(f"[SAVE] Saved {count} profiles to {s3_key}")
         
         if stop_fetching:
-            print(f"[INFO] Reached profiles older than 1 minute ({start_ts}). Stopping.")
+            print(f"[INFO] Reached profiles older than 3 hours ({start_ts}). Stopping.")
             break
 
         # 6. Pagination
@@ -231,7 +231,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         params = None 
         page_index += 1
         
-        # Politeness sleep (optional but recommended to prevent burst limits)
         time.sleep(0.1)
 
     return {
