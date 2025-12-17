@@ -3,8 +3,8 @@ import json
 import os
 import random
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, Optional
 
 import boto3
 import requests
@@ -12,146 +12,83 @@ import requests
 # --- Configuration ---
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-REQUEST_TIMEOUT = (10, 60)  # (connect_timeout, read_timeout)
+MAX_PAGES_PER_RUN = 50  # Lambda restarts itself after 50 pages
+REQUEST_TIMEOUT = (10, 60)
+
+# Custom fields to flatten (optional, but good for analysis)
 CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
 }
+
+# Constants
 SECRET_NAME = "klaviyo"
 SECRET_KEY_NAME = "API_KEY"
+BUCKET_NAME = os.environ.get("KLAVIYO_PROFILES_BUCKET")
 
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
+_lambda_client = boto3.client("lambda")
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
-    """Fetch the Klaviyo API key from AWS Secrets Manager."""
+    """Fetch API Key from AWS Secrets Manager."""
     resp = _secrets_client.get_secret_value(SecretId=secret_name)
     secret = resp.get("SecretString")
     if secret is None:
         binary_secret = resp.get("SecretBinary")
         if binary_secret is None:
-            raise ValueError(f"Secret {secret_name} has no payload")
+            raise ValueError(f"Secret {secret_name} is empty.")
         secret = base64.b64decode(binary_secret).decode("utf-8")
 
     try:
         parsed = json.loads(secret)
         if isinstance(parsed, dict):
-            api_key = (
-                parsed.get(key_name)
-                or parsed.get("api_key")
-                or parsed.get("KLAVIYO_API_KEY")
-            )
-            if api_key:
-                return api_key
+            return parsed.get(key_name) or parsed.get("api_key")
     except json.JSONDecodeError:
         pass
-
     return secret
 
 
-def make_session(api_key: str, pool_maxsize: int = 20) -> requests.Session:
+def make_session(api_key: str) -> requests.Session:
+    """Create a reuseable HTTP session with standard headers."""
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=pool_maxsize,
-        pool_maxsize=pool_maxsize,
-        max_retries=0,
-    )
+    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
     session.mount("https://", adapter)
     session.headers.update({
         "Authorization": f"Klaviyo-API-Key {api_key}",
         "accept": "application/json",
         "revision": API_REVISION,
-        "Connection": "keep-alive",
     })
     return session
 
 
-def safe_get(
-    session: requests.Session,
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    max_retries: int = 4,
-    timeout: tuple = (10, 60),
-) -> requests.Response:
-    """GET with basic retry & backoff."""
+def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None) -> requests.Response:
+    """Get with retry logic for network blips."""
     attempt = 0
     while True:
         try:
-            response = session.get(url, params=params, timeout=timeout)
-        except (
-            requests.exceptions.ReadTimeout,
-            requests.exceptions.ConnectTimeout,
-            requests.exceptions.ChunkedEncodingError,
-            requests.exceptions.ConnectionError,
-        ) as exc:
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
             attempt += 1
-            if attempt > max_retries:
-                raise
-            sleep_seconds = min(2 ** attempt, 30) + random.uniform(0, 1)
-            print(f"[WARN] Network issue: {exc}. Retrying in {sleep_seconds:.1f}s")
-            time.sleep(sleep_seconds)
+            if attempt > 4: raise
+            print(f"[WARN] Network error: {e}. Retrying...")
+            time.sleep(2 ** attempt)
             continue
 
-        if response.status_code in (429, 500, 502, 503, 504):
+        if resp.status_code in [429, 500, 502, 503, 504]:
             attempt += 1
-            if attempt > max_retries:
-                response.raise_for_status()
-            sleep_seconds = min(2 ** attempt, 30) + random.uniform(0, 1)
-            print(f"[WARN] HTTP {response.status_code}. Retrying in {sleep_seconds:.1f}s")
-            time.sleep(sleep_seconds)
+            if attempt > 4: resp.raise_for_status()
+            print(f"[WARN] HTTP {resp.status_code}. Retrying...")
+            time.sleep(2 ** attempt)
             continue
-
-        if response.status_code == 400:
-            print(f"[ERROR] 400 Bad Request. URL: {url} Params: {params}")
-            print(f"[ERROR] Response body: {response.text}")
-            response.raise_for_status()
-
-        response.raise_for_status()
-        return response
-
-
-def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[str, Any]) -> str:
-    key = f"{prefix}/page_{page_index}.json"
-    body = json.dumps(payload).encode("utf-8")
-    _s3_client.put_object(Bucket=bucket_name, Key=key, Body=body)
-    return key
-
-
-def get_target_window(date_str: Optional[str]) -> Tuple[datetime, datetime, str]:
-    """
-    Returns (start_dt, end_dt, date_string) in UTC.
-    If no date provided, defaults to Yesterday.
-    """
-    if date_str:
-        # User provided specific date (e.g., from SQS or Test Event)
-        start = datetime.strptime(date_str, "%Y-%m-%d")
-    else:
-        # Default to Yesterday
-        base = datetime.utcnow() - timedelta(days=1)
-        start = datetime(base.year, base.month, base.day)
-        date_str = start.strftime("%Y-%m-%d")
-
-    # Make start aware (UTC)
-    start = start.replace(tzinfo=timezone.utc)
-    # End is exactly 24 hours later
-    end = start + timedelta(days=1)
-    
-    return start, end, date_str
-
-
-def parse_klaviyo_date(date_str: str) -> datetime:
-    """Helper to parse ISO strings like '2025-12-16T12:00:00+00:00' or '...Z'"""
-    # Fix 'Z' to '+00:00' for standard fromisoformat compatibility
-    if date_str.endswith('Z'):
-        date_str = date_str[:-1] + '+00:00'
-    
-    dt = datetime.fromisoformat(date_str)
-    # Ensure UTC
-    return dt.astimezone(timezone.utc)
+        
+        resp.raise_for_status()
+        return resp
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
+    """Helper: Pulls specific nested properties to the top level."""
     records = payload.get("data")
     if not isinstance(records, list):
         return
@@ -159,7 +96,7 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
     for record in records:
         if not isinstance(record, dict):
             continue
-
+        
         attributes = record.get("attributes") or {}
         properties = attributes.get("properties") or {}
         if not isinstance(properties, dict):
@@ -169,127 +106,100 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
             record[column_name] = properties.get(property_key)
 
 
-def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
+def save_payload(bucket: str, key: str, data: Dict) -> None:
+    _s3_client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode("utf-8"))
+
+
+def invoke_next_lambda(function_name: str, next_url: str, next_page_index: int, run_id: str):
     """
-    Fetches profiles updated on a specific 'date'.
-    Strategy: Sort by -updated (newest first).
-      1. Skip records newer than (date + 1 day).
-      2. Save records within (date).
-      3. STOP when we hit records older than (date).
+    Triggers the next batch asynchronously.
     """
-    event = event or {}
-    start_time = time.time()
-
-    bucket_name = os.environ.get("KLAVIYO_PROFILES_BUCKET")
-    if not bucket_name:
-        raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
-
-    # 1. Determine the exact 24-hour window we want to scrape
-    start_ts, end_ts, target_date_str = get_target_window(event.get("date") or event.get("run_date"))
-
-    prefix = f"profiles/{target_date_str}"
-    print(f"[INFO] Target Window: {start_ts} to {end_ts} (Target Date: {target_date_str})")
-
-    secret_name = event.get("secret_name") or SECRET_NAME
-    secret_key = event.get("secret_key") or SECRET_KEY_NAME
-
-    api_key = get_api_key(secret_name, secret_key).strip()
-    session = make_session(api_key)
-
-    url = "https://a.klaviyo.com/api/profiles/"
-    
-    # 2. KEY CHANGE: Sort by newest first, NO filter parameter
-    params: Dict[str, Any] = {
-        "page[size]": str(PAGE_SIZE),
-        "sort": "-updated",
-        "additional-fields[profile]": "subscriptions",
+    payload = {
+        "next_url": next_url,
+        "page_index": next_page_index,
+        "run_id": run_id
     }
+    print(f"[RECURSION] Invoking self for page {next_page_index}...")
+    _lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType='Event',  # Asynchronous (Fire & Forget)
+        Payload=json.dumps(payload)
+    )
 
-    pages_saved = 0
-    page_index = 1
-    total_profiles = 0
-    stop_fetching = False
 
+def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    # 1. Setup Context (New Run vs Continuation)
+    run_id = event.get("run_id")
+    if not run_id:
+        # Create a unique ID for this full dump (e.g., "full_dump_2025-12-17_093000")
+        run_id = datetime.utcnow().strftime("full_dump_%Y-%m-%d_%H%M%S")
+        print(f"[START] Starting NEW full profile dump. Run ID: {run_id}")
+
+    # 2. Determine Start Position
+    # If we have a 'next_url', we use it. If not, we start from the beginning.
+    url = event.get("next_url") or "https://a.klaviyo.com/api/profiles/"
+    page_index = event.get("page_index") or 1
+    
+    # Params are only needed for the very first call. 
+    # Subsequent 'next' links from Klaviyo already include encoded params.
+    params = None
+    if not event.get("next_url"):
+        params = {
+            "page[size]": str(PAGE_SIZE),
+            "sort": "-updated", 
+            "additional-fields[profile]": "subscriptions"
+        }
+
+    # 3. Initialize Connections
+    if not BUCKET_NAME:
+        raise ValueError("Environment variable KLAVIYO_PROFILES_BUCKET is missing.")
+        
+    api_key = get_api_key()
+    if not api_key:
+        raise ValueError("API Key not found.")
+        
+    session = make_session(api_key)
+    pages_processed_this_run = 0
+
+    print(f"[INFO] Processing Run '{run_id}' | Starting at Page {page_index}")
+
+    # 4. Processing Loop
     while True:
-        response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
+        # A. Safety Check: Restart Lambda if we hit the batch limit
+        if pages_processed_this_run >= MAX_PAGES_PER_RUN:
+            print(f"[LIMIT] Reached {MAX_PAGES_PER_RUN} pages. Recursing...")
+            invoke_next_lambda(context.function_name, url, page_index, run_id)
+            return {"status": "continued", "next_page": page_index}
+
+        # B. Fetch Data
+        response = safe_get(session, url, params=params)
         payload = response.json()
         
+        # C. Process Data (Flatten columns)
         add_custom_columns(payload)
-        raw_data = payload.get("data") or []
+        data = payload.get("data") or []
 
-        if not raw_data:
-            print("[INFO] No more profiles available from API.")
+        if not data:
+            print("[FINISH] No more data returned by API. Job complete.")
             break
 
-        valid_records = []
-        
-        # 3. Client-Side Filter Loop
-        for record in raw_data:
-            updated_str = record.get("attributes", {}).get("updated")
-            if not updated_str:
-                continue
+        # D. Save to S3
+        s3_key = f"profiles/{run_id}/page_{page_index}.json"
+        save_payload(BUCKET_NAME, s3_key, payload)
+        print(f"[SAVE] Saved {len(data)} profiles to {s3_key}")
 
-            try:
-                record_dt = parse_klaviyo_date(updated_str)
-            except ValueError:
-                continue
-
-            # Case A: Record is NEWER than our target day (e.g. from Today, but we want Yesterday)
-            # We skip this record, but we must CONTINUE fetching pages to find older ones.
-            if record_dt >= end_ts:
-                continue
-            
-            # Case B: Record is OLDER than our target day.
-            # Since we are sorting by newest, this means ALL future records are too old.
-            # We STOP immediately.
-            if record_dt < start_ts:
-                stop_fetching = True
-                break
-            
-            # Case C: Record is INSIDE our target day. Keep it.
-            valid_records.append(record)
-
-        # 4. Save if we found any valid records on this page
-        if valid_records:
-            payload["data"] = valid_records
-            # Clean up links to avoid confusion
-            if "links" in payload:
-                del payload["links"]
-            
-            key = save_payload(bucket_name, prefix, page_index, payload)
-            print(f"[INFO] Saved page {page_index} ({len(valid_records)} profiles) to s3://{bucket_name}/{key}")
-            pages_saved += 1
-            total_profiles += len(valid_records)
-        else:
-            # If valid_records is empty but stop_fetching is False, it means
-            # the entire page was "Too New". We just proceed to the next page.
-            pass
-
-        if stop_fetching:
-            print(f"[INFO] Reached profiles updated before {start_ts}. Stopping sync.")
-            break
-
-        # Pagination
-        next_url = (response.json().get("links") or {}).get("next")
-        if not next_url:
-            break
-
-        url, params = next_url, None
+        # E. Advance Pointers
+        pages_processed_this_run += 1
         page_index += 1
+        
+        # F. Get Next Link
+        next_link = (payload.get("links") or {}).get("next")
+        if not next_link:
+            print("[FINISH] No 'next' link provided. Job complete.")
+            break
+        
+        # Update URL for next loop (params are inside the link now)
+        url = next_link
+        params = None 
 
-    elapsed = time.time() - start_time
-    print(f"[INFO] Finished {target_date_str} window in {elapsed:.2f}s. Saved {total_profiles} profiles across {pages_saved} pages.")
-
-    return {
-        "pages_saved": pages_saved,
-        "total_profiles": total_profiles,
-        "run_date": target_date_str,
-        "elapsed_seconds": elapsed,
-        "s3_prefix": f"s3://{bucket_name}/{prefix}/",
-    }
-
-if __name__ == "__main__":
-    # Local Testing
-    # os.environ["KLAVIYO_PROFILES_BUCKET"] = "my-test-bucket"
-    # handler({"date": "2024-01-01"})
-    pass
+    return {"status": "completed", "total_pages": page_index, "run_id": run_id}
