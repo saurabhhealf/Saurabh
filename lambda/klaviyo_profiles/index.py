@@ -3,12 +3,13 @@ import json
 import os
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import boto3
 import requests
 
+# --- Configuration ---
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
 REQUEST_TIMEOUT = (10, 60)  # (connect_timeout, read_timeout)
@@ -73,7 +74,7 @@ def safe_get(
     max_retries: int = 4,
     timeout: tuple = (10, 60),
 ) -> requests.Response:
-    """GET with basic retry & backoff. Used for ONE page per Lambda."""
+    """GET with basic retry & backoff."""
     attempt = 0
     while True:
         try:
@@ -102,7 +103,8 @@ def safe_get(
             continue
 
         if response.status_code == 400:
-            print(f"[ERROR] 400 Bad Request. Response body: {response.text}")
+            print(f"[ERROR] 400 Bad Request. URL: {url} Params: {params}")
+            print(f"[ERROR] Response body: {response.text}")
             response.raise_for_status()
 
         response.raise_for_status()
@@ -116,51 +118,40 @@ def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[s
     return key
 
 
-def normalize_date_range(
-    date_str: Optional[str],
-    start_dt: Optional[str],
-    end_dt: Optional[str],
-    default_date: Optional[datetime] = None,
-) -> Tuple[str, str]:
+def get_target_window(date_str: Optional[str]) -> Tuple[datetime, datetime, str]:
     """
-    Resolve the date range we should pull.
-    If date_str (YYYY-MM-DD) is provided, we use that full day in UTC.
-    Otherwise start_dt and end_dt must both be present.
+    Returns (start_dt, end_dt, date_string) in UTC.
+    If no date provided, defaults to Yesterday.
     """
     if date_str:
+        # User provided specific date (e.g., from SQS or Test Event)
         start = datetime.strptime(date_str, "%Y-%m-%d")
-        end = start + timedelta(days=1)
-        return (
-            f"{start:%Y-%m-%dT%H:%M:%S}Z",
-            f"{end:%Y-%m-%dT%H:%M:%S}Z",
-        )
+    else:
+        # Default to Yesterday
+        base = datetime.utcnow() - timedelta(days=1)
+        start = datetime(base.year, base.month, base.day)
+        date_str = start.strftime("%Y-%m-%d")
 
-    if start_dt and end_dt:
-        return start_dt, end_dt
-
-    base = default_date or (datetime.utcnow() - timedelta(days=1))
-    base = datetime(base.year, base.month, base.day)
-    next_day = base + timedelta(days=1)
-    return (
-        f"{base:%Y-%m-%dT%H:%M:%S}Z",
-        f"{next_day:%Y-%m-%dT%H:%M:%S}Z",
-    )
+    # Make start aware (UTC)
+    start = start.replace(tzinfo=timezone.utc)
+    # End is exactly 24 hours later
+    end = start + timedelta(days=1)
+    
+    return start, end, date_str
 
 
-def build_updated_filter(start_datetime: str, end_datetime: str) -> str:
-    """
-    Build a Klaviyo API filter that limits profiles by updated timestamp.
-    """
-    return (
-        f"and(greater-or-equal(updated,{start_datetime}),"
-        f"less-than(updated,{end_datetime}))"
-    )
+def parse_klaviyo_date(date_str: str) -> datetime:
+    """Helper to parse ISO strings like '2025-12-16T12:00:00+00:00' or '...Z'"""
+    # Fix 'Z' to '+00:00' for standard fromisoformat compatibility
+    if date_str.endswith('Z'):
+        date_str = date_str[:-1] + '+00:00'
+    
+    dt = datetime.fromisoformat(date_str)
+    # Ensure UTC
+    return dt.astimezone(timezone.utc)
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
-    """
-    Surface select Klaviyo profile properties as first-class columns.
-    """
     records = payload.get("data")
     if not isinstance(records, list):
         return
@@ -180,8 +171,11 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
 
 def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
     """
-    Fetch a single day's worth of profiles (or a custom date range) and write
-    every page from that slice to S3 in one Lambda invocation.
+    Fetches profiles updated on a specific 'date'.
+    Strategy: Sort by -updated (newest first).
+      1. Skip records newer than (date + 1 day).
+      2. Save records within (date).
+      3. STOP when we hit records older than (date).
     """
     event = event or {}
     start_time = time.time()
@@ -190,51 +184,93 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
 
-    default_day = datetime.utcnow() - timedelta(days=1)
-    target_date = event.get("date") or event.get("run_date") or default_day.strftime("%Y-%m-%d")
-    start_dt, end_dt = normalize_date_range(
-        event.get("date") or event.get("run_date"),
-        event.get("start_datetime"),
-        event.get("end_datetime"),
-        default_day,
-    )
+    # 1. Determine the exact 24-hour window we want to scrape
+    start_ts, end_ts, target_date_str = get_target_window(event.get("date") or event.get("run_date"))
 
-    prefix = f"profiles/{target_date}"
+    prefix = f"profiles/{target_date_str}"
+    print(f"[INFO] Target Window: {start_ts} to {end_ts} (Target Date: {target_date_str})")
 
     secret_name = event.get("secret_name") or SECRET_NAME
     secret_key = event.get("secret_key") or SECRET_KEY_NAME
 
     api_key = get_api_key(secret_name, secret_key).strip()
-    if not api_key:
-        raise ValueError(f"Secret {secret_name} did not return an API key")
     session = make_session(api_key)
 
     url = "https://a.klaviyo.com/api/profiles/"
+    
+    # 2. KEY CHANGE: Sort by newest first, NO filter parameter
     params: Dict[str, Any] = {
         "page[size]": str(PAGE_SIZE),
-        "sort": "updated",
+        "sort": "-updated",
         "additional-fields[profile]": "subscriptions",
-        "filter": build_updated_filter(start_dt, end_dt),
     }
 
     pages_saved = 0
     page_index = 1
+    total_profiles = 0
+    stop_fetching = False
 
     while True:
         response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
         payload = response.json()
+        
         add_custom_columns(payload)
+        raw_data = payload.get("data") or []
 
-        data = payload.get("data") or []
-        if not data:
-            print("[INFO] No more profiles in this window; finishing.")
+        if not raw_data:
+            print("[INFO] No more profiles available from API.")
             break
 
-        key = save_payload(bucket_name, prefix, page_index, payload)
-        print(f"[INFO] Saved page {page_index} ({len(data)} profiles) to s3://{bucket_name}/{key}")
-        pages_saved += 1
+        valid_records = []
+        
+        # 3. Client-Side Filter Loop
+        for record in raw_data:
+            updated_str = record.get("attributes", {}).get("updated")
+            if not updated_str:
+                continue
 
-        next_url = (payload.get("links") or {}).get("next")
+            try:
+                record_dt = parse_klaviyo_date(updated_str)
+            except ValueError:
+                continue
+
+            # Case A: Record is NEWER than our target day (e.g. from Today, but we want Yesterday)
+            # We skip this record, but we must CONTINUE fetching pages to find older ones.
+            if record_dt >= end_ts:
+                continue
+            
+            # Case B: Record is OLDER than our target day.
+            # Since we are sorting by newest, this means ALL future records are too old.
+            # We STOP immediately.
+            if record_dt < start_ts:
+                stop_fetching = True
+                break
+            
+            # Case C: Record is INSIDE our target day. Keep it.
+            valid_records.append(record)
+
+        # 4. Save if we found any valid records on this page
+        if valid_records:
+            payload["data"] = valid_records
+            # Clean up links to avoid confusion
+            if "links" in payload:
+                del payload["links"]
+            
+            key = save_payload(bucket_name, prefix, page_index, payload)
+            print(f"[INFO] Saved page {page_index} ({len(valid_records)} profiles) to s3://{bucket_name}/{key}")
+            pages_saved += 1
+            total_profiles += len(valid_records)
+        else:
+            # If valid_records is empty but stop_fetching is False, it means
+            # the entire page was "Too New". We just proceed to the next page.
+            pass
+
+        if stop_fetching:
+            print(f"[INFO] Reached profiles updated before {start_ts}. Stopping sync.")
+            break
+
+        # Pagination
+        next_url = (response.json().get("links") or {}).get("next")
         if not next_url:
             break
 
@@ -242,20 +278,18 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
         page_index += 1
 
     elapsed = time.time() - start_time
-    print(f"[INFO] Finished {target_date} window in {elapsed:.1f}s ({pages_saved} pages).")
+    print(f"[INFO] Finished {target_date_str} window in {elapsed:.2f}s. Saved {total_profiles} profiles across {pages_saved} pages.")
 
     return {
         "pages_saved": pages_saved,
-        "run_date": target_date,
-        "start_datetime": start_dt,
-        "end_datetime": end_dt,
+        "total_profiles": total_profiles,
+        "run_date": target_date_str,
+        "elapsed_seconds": elapsed,
         "s3_prefix": f"s3://{bucket_name}/{prefix}/",
     }
 
-
 if __name__ == "__main__":
-    result = handler()
-    print(
-        f"[DONE] Saved {result['pages_saved']} pages to {result['s3_prefix']}, "
-        f"page_index={result['page_index']}, done={result['done']}"
-    )
+    # Local Testing
+    # os.environ["KLAVIYO_PROFILES_BUCKET"] = "my-test-bucket"
+    # handler({"date": "2024-01-01"})
+    pass
