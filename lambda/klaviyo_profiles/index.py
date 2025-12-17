@@ -142,8 +142,8 @@ def normalize_date_range(
     base = datetime(base.year, base.month, base.day)
     next_day = base + timedelta(days=1)
     return (
-        f"{base:%Y-%m-%dT%H:%M:%S}+00:00",
-        f"{next_day:%Y-%m-%dT%H:%M:%S}+00:00",
+        f"{base:%Y-%m-%dT%H:%M:%S}Z",
+        f"{next_day:%Y-%m-%dT%H:%M:%S}Z",
     )
 
 
