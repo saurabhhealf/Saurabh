@@ -12,9 +12,9 @@ import requests
 # --- Configuration ---
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-# We only want 1 minute of data, so we likely won't need many pages. 
-# But we keep a safety limit just in case.
-MAX_PAGES_SAFETY_LIMIT = 20  
+# Safety Limit: 50 pages = 5,000 profiles/minute. 
+# This is plenty for "last 1 minute" unless you have massive spikes.
+MAX_PAGES_SAFETY_LIMIT = 50 
 REQUEST_TIMEOUT = (10, 60)
 
 # Custom fields to flatten
@@ -65,23 +65,37 @@ def make_session(api_key: str) -> requests.Session:
 
 
 def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None) -> requests.Response:
-    """Get with retry logic for network blips."""
+    """
+    Robust GET with logic to handle Klaviyo's specific 429 Rate Limits.
+    """
     attempt = 0
+    max_retries = 5
+    
     while True:
         try:
             resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             attempt += 1
-            if attempt > 4: raise
-            print(f"[WARN] Network error: {e}. Retrying...")
-            time.sleep(2 ** attempt)
+            if attempt > max_retries: raise
+            sleep_time = min(2 ** attempt, 30) + random.uniform(0, 1)
+            print(f"[WARN] Network error: {e}. Retrying in {sleep_time:.2f}s...")
+            time.sleep(sleep_time)
             continue
 
-        if resp.status_code in [429, 500, 502, 503, 504]:
+        # Handle Rate Limits (429) specifically using the Retry-After header
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 10))
+            print(f"[WARN] Rate Limit Hit (429). Sleeping for {retry_after} seconds...")
+            time.sleep(retry_after + 1) # Add 1s buffer
+            continue
+
+        # Handle other temporary server errors
+        if resp.status_code in [500, 502, 503, 504]:
             attempt += 1
-            if attempt > 4: resp.raise_for_status()
-            print(f"[WARN] HTTP {resp.status_code}. Retrying...")
-            time.sleep(2 ** attempt)
+            if attempt > max_retries: resp.raise_for_status()
+            sleep_time = min(2 ** attempt, 30)
+            print(f"[WARN] Server Error {resp.status_code}. Retrying in {sleep_time}s...")
+            time.sleep(sleep_time)
             continue
         
         resp.raise_for_status()
@@ -142,8 +156,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     url = "https://a.klaviyo.com/api/profiles/"
     params = {
         "page[size]": str(PAGE_SIZE),
-        "sort": "-updated", # Newest first is critical for this strategy
-        "additional-fields[profile]": "subscriptions"
+        "sort": "-updated", # Newest first is critical
+        "additional-fields[profile]": "subscriptions" # This is safe for rate limits
     }
 
     page_index = 1
@@ -179,26 +193,23 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             except ValueError:
                 continue
 
-            # If record is newer than our "end_ts" (technically impossible if end_ts is NOW, 
-            # but good safety if clock skew exists), we skip it but keep scanning.
+            # Skip future records (clock skew safety)
             if record_dt > end_ts:
                 continue
 
-            # CRITICAL CHECK:
-            # If we see a record older than 1 minute ago, we STOP completely.
-            # Because the list is sorted by newest, everyone after this is also too old.
+            # STOP if older than 1 minute
             if record_dt < start_ts:
                 stop_fetching = True
                 break
             
-            # If we are here, the record is within the last minute
+            # Keep record
             valid_records.append(record)
 
         # 5. Save Valid Records
         if valid_records:
             # Only save the filtered list
             payload["data"] = valid_records
-            if "links" in payload: del payload["links"] # Clean up metadata
+            if "links" in payload: del payload["links"] 
             
             s3_key = f"profiles/{run_id}/page_{page_index}.json"
             save_payload(BUCKET_NAME, s3_key, payload)
@@ -219,6 +230,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         url = next_link
         params = None 
         page_index += 1
+        
+        # Politeness sleep (optional but recommended to prevent burst limits)
+        time.sleep(0.1)
 
     return {
         "status": "completed", 
