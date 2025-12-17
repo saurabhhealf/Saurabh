@@ -3,8 +3,8 @@ import json
 import os
 import random
 import time
-import uuid
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Tuple
 
 import boto3
 import requests
@@ -12,18 +12,15 @@ import requests
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
 REQUEST_TIMEOUT = (10, 60)  # (connect_timeout, read_timeout)
-CHAIN_MAX_RETRIES = 3
 CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
 }
 SECRET_NAME = "klaviyo"
 SECRET_KEY_NAME = "API_KEY"
-QUEUE_URL_ENV = "KLAVIYO_PROFILES_QUEUE_URL"
 
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
-_sqs_client = boto3.client("sqs")
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
@@ -119,62 +116,45 @@ def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[s
     return key
 
 
-def send_next_page_message(queue_url: Optional[str], payload: Dict[str, Any]) -> bool:
+def normalize_date_range(
+    date_str: Optional[str],
+    start_dt: Optional[str],
+    end_dt: Optional[str],
+    default_date: Optional[datetime] = None,
+) -> Tuple[str, str]:
     """
-    Push the next-page payload to SQS so another Lambda invocation can pick it up.
-    Returns True once SendMessage succeeds.
+    Resolve the date range we should pull.
+    If date_str (YYYY-MM-DD) is provided, we use that full day in UTC.
+    Otherwise start_dt and end_dt must both be present.
     """
-    if not queue_url:
-        print("[INFO] KLAVIYO_PROFILES_QUEUE_URL is not set; skipping automatic chaining.")
-        return False
+    if date_str:
+        start = datetime.strptime(date_str, "%Y-%m-%d")
+        end = start + timedelta(days=1)
+        return (
+            f"{start:%Y-%m-%dT%H:%M:%S}+00:00",
+            f"{end:%Y-%m-%dT%H:%M:%S}+00:00",
+        )
 
-    attempt = 0
-    while True:
-        try:
-            _sqs_client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(payload))
-            print(f"[INFO] Queued next page {payload.get('page_index')} to {queue_url}.")
-            return True
-        except Exception as exc:
-            attempt += 1
-            if attempt > CHAIN_MAX_RETRIES:
-                raise RuntimeError(
-                    f"Failed to enqueue page {payload.get('page_index')} after {attempt} attempts"
-                ) from exc
-            sleep_seconds = min(2 ** attempt, 30) + random.uniform(0, 1)
-            print(
-                f"[WARN] Unable to enqueue page {payload.get('page_index')}: {exc}. "
-                f"Retrying in {sleep_seconds:.1f}s"
-            )
-            time.sleep(sleep_seconds)
+    if start_dt and end_dt:
+        return start_dt, end_dt
+
+    base = default_date or (datetime.utcnow() - timedelta(days=1))
+    base = datetime(base.year, base.month, base.day)
+    next_day = base + timedelta(days=1)
+    return (
+        f"{base:%Y-%m-%dT%H:%M:%S}+00:00",
+        f"{next_day:%Y-%m-%dT%H:%M:%S}+00:00",
+    )
 
 
-def unwrap_event(event: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def build_updated_filter(start_datetime: str, end_datetime: str) -> str:
     """
-    Accepts either a direct invoke payload or an SQS event and returns the intended payload.
+    Build a Klaviyo API filter that limits profiles by updated timestamp.
     """
-    if not event:
-        return {}
-
-    records = event.get("Records")
-    if isinstance(records, list) and records:
-        if len(records) > 1:
-            print(f"[WARN] Received {len(records)} SQS records; only processing the first one.")
-        first = records[0] or {}
-        body = first.get("body")
-        if isinstance(body, str):
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError:
-                print("[WARN] Unable to parse SQS body as JSON; passing raw fields through.")
-        return first
-
-    return event
-
-
-def generate_run_id(seed: Optional[str] = None) -> str:
-    if seed:
-        return seed
-    return f"{time.strftime('%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    return (
+        f"and(greater-or-equal(updated,{start_datetime}),"
+        f"less-than(updated,{end_datetime}))"
+    )
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
@@ -200,35 +180,26 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
 
 def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
     """
-    One Lambda invocation = ONE Klaviyo page.
-
-    Input (event):
-      - next_url (optional): Klaviyo 'next' link from previous page
-      - page_index (optional): which page number to write (default 1)
-      - run_date (optional): snapshot date; kept constant across the whole run
-      - secret_name/secret_key (optional): override the default secret lookup
-      - run_id (optional): unique identifier appended to the S3 prefix
-
-    Output:
-      - done: bool (True when there is NO next page)
-      - next_url: str | None (pass this into the next invocation)
-      - page_index: int (the next page index to use)
-      - run_date: str (YYYY-MM-DD)
-      - pages_saved: int (always 1 unless there was no data)
-      - run_id: str
-      - s3_prefix: str
-      - next_invocation_triggered: bool (True when we queued the subsequent Lambda via SQS)
+    Fetch a single day's worth of profiles (or a custom date range) and write
+    every page from that slice to S3 in one Lambda invocation.
     """
-    event = unwrap_event(event)
+    event = event or {}
+    start_time = time.time()
 
     bucket_name = os.environ.get("KLAVIYO_PROFILES_BUCKET")
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
 
-    # One export run == one date prefix
-    run_date = event.get("run_date") or time.strftime("%Y-%m-%d")
-    run_id = generate_run_id(event.get("run_id"))
-    prefix = f"profiles/{run_date}/{run_id}"
+    default_day = datetime.utcnow() - timedelta(days=1)
+    target_date = event.get("date") or event.get("run_date") or default_day.strftime("%Y-%m-%d")
+    start_dt, end_dt = normalize_date_range(
+        event.get("date") or event.get("run_date"),
+        event.get("start_datetime"),
+        event.get("end_datetime"),
+        default_day,
+    )
+
+    prefix = f"profiles/{target_date}"
 
     secret_name = event.get("secret_name") or SECRET_NAME
     secret_key = event.get("secret_key") or SECRET_KEY_NAME
@@ -238,70 +209,47 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
         raise ValueError(f"Secret {secret_name} did not return an API key")
     session = make_session(api_key)
 
-    # Decide which URL to hit
-    url_from_event = event.get("next_url")
-    if url_from_event:
-        # Continue from previous page
-        url = url_from_event
-        params: Optional[Dict[str, Any]] = None  # full URL already includes query string
-    else:
-        # First page
-        url = "https://a.klaviyo.com/api/profiles/"
-        params = {
-            "page[size]": str(PAGE_SIZE),
-            "sort": "updated",
-            "additional-fields[profile]": "subscriptions",
-        }
+    url = "https://a.klaviyo.com/api/profiles/"
+    params: Dict[str, Any] = {
+        "page[size]": str(PAGE_SIZE),
+        "sort": "updated",
+        "additional-fields[profile]": "subscriptions",
+        "filter": build_updated_filter(start_dt, end_dt),
+    }
 
-    page_index = int(event.get("page_index", 1))
+    pages_saved = 0
+    page_index = 1
 
-    # EXACTLY ONE REQUEST = ONE PAGE
-    response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
-    payload = response.json()
-    add_custom_columns(payload)
+    while True:
+        response = safe_get(session, url, params=params, timeout=REQUEST_TIMEOUT)
+        payload = response.json()
+        add_custom_columns(payload)
 
-    data = payload.get("data") or []
-    if not data:
-        print("[INFO] No profiles returned on this page; finishing.")
-        return {
-            "done": True,
-            "next_url": None,
-            "page_index": page_index,  # unchanged
-            "pages_saved": 0,
-            "run_date": run_date,
-            "run_id": run_id,
-            "s3_prefix": f"s3://{bucket_name}/{prefix}/",
-            "next_invocation_triggered": False,
-        }
+        data = payload.get("data") or []
+        if not data:
+            print("[INFO] No more profiles in this window; finishing.")
+            break
 
-    key = save_payload(bucket_name, prefix, page_index, payload)
-    print(f"[INFO] Saved page {page_index} ({len(data)} profiles) to s3://{bucket_name}/{key}")
+        key = save_payload(bucket_name, prefix, page_index, payload)
+        print(f"[INFO] Saved page {page_index} ({len(data)} profiles) to s3://{bucket_name}/{key}")
+        pages_saved += 1
 
-    next_url = (payload.get("links") or {}).get("next")
-    next_invocation_triggered = False
-    queue_url = os.environ.get(QUEUE_URL_ENV)
+        next_url = (payload.get("links") or {}).get("next")
+        if not next_url:
+            break
 
-    if next_url:
-        next_payload = {
-            "next_url": next_url,
-            "page_index": page_index + 1,
-            "run_date": run_date,
-            "run_id": run_id,
-            "secret_name": secret_name,
-            "secret_key": secret_key,
-        }
-        next_invocation_triggered = send_next_page_message(queue_url, next_payload)
+        url, params = next_url, None
+        page_index += 1
 
-    # This output is shaped so the **next** invocation can just receive it as input.
+    elapsed = time.time() - start_time
+    print(f"[INFO] Finished {target_date} window in {elapsed:.1f}s ({pages_saved} pages).")
+
     return {
-        "done": not bool(next_url),
-        "next_url": next_url,
-        "page_index": page_index + 1,
-        "pages_saved": 1,
-        "run_date": run_date,
-        "run_id": run_id,
+        "pages_saved": pages_saved,
+        "run_date": target_date,
+        "start_datetime": start_dt,
+        "end_datetime": end_dt,
         "s3_prefix": f"s3://{bucket_name}/{prefix}/",
-        "next_invocation_triggered": next_invocation_triggered,
     }
 
 
