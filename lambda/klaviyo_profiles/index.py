@@ -152,8 +152,8 @@ def build_updated_filter(start_datetime: str, end_datetime: str) -> str:
     Build a Klaviyo API filter that limits profiles by updated timestamp.
     """
     return (
-        f'and(greater-or-equal(updated,"{start_datetime}"),'
-        f'less-than(updated,"{end_datetime}"))'
+        f"and(greater-or-equal(updated,{start_datetime}),"
+        f"less-than(updated,{end_datetime}))"
     )
 
 
