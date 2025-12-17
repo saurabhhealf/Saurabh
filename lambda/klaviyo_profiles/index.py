@@ -131,8 +131,8 @@ def normalize_date_range(
         start = datetime.strptime(date_str, "%Y-%m-%d")
         end = start + timedelta(days=1)
         return (
-            f"{start:%Y-%m-%dT%H:%M:%S}+00:00",
-            f"{end:%Y-%m-%dT%H:%M:%S}+00:00",
+            f"{start:%Y-%m-%dT%H:%M:%S}Z",
+            f"{end:%Y-%m-%dT%H:%M:%S}Z",
         )
 
     if start_dt and end_dt:
