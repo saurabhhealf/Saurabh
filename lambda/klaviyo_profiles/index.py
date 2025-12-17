@@ -10,7 +10,7 @@ import requests
 
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-REQUEST_TIMEOUT = (10, 60)
+REQUEST_TIMEOUT = (10, 60)  # (connect_timeout, read_timeout)
 CUSTOM_PROFILE_PROPERTIES = {
     "DATE_OF_BIRTH": "Date_of_Birth",
     "LAST_FEMALE_CYCLE_STATUS": "Last_Female_Cycle_Status",
@@ -23,6 +23,7 @@ _s3_client = boto3.client("s3")
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
+    """Fetch the Klaviyo API key from AWS Secrets Manager."""
     resp = _secrets_client.get_secret_value(SecretId=secret_name)
     secret = resp.get("SecretString")
     if secret is None:
@@ -71,14 +72,17 @@ def safe_get(
     max_retries: int = 4,
     timeout: tuple = (10, 60),
 ) -> requests.Response:
+    """GET with basic retry & backoff. Used for ONE page per Lambda."""
     attempt = 0
     while True:
         try:
             response = session.get(url, params=params, timeout=timeout)
-        except (requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ConnectionError) as exc:
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ConnectionError,
+        ) as exc:
             attempt += 1
             if attempt > max_retries:
                 raise
@@ -112,6 +116,9 @@ def save_payload(bucket_name: str, prefix: str, page_index: int, payload: Dict[s
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
+    """
+    Surface select Klaviyo profile properties as first-class columns.
+    """
     records = payload.get("data")
     if not isinstance(records, list):
         return
@@ -130,14 +137,29 @@ def add_custom_columns(payload: Dict[str, Any]) -> None:
 
 
 def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dict[str, Any]:
+    """
+    One Lambda invocation = ONE Klaviyo page.
+
+    Input (event):
+      - next_url (optional): Klaviyo 'next' link from previous page
+      - page_index (optional): which page number to write (default 1)
+      - run_date (optional): snapshot date; kept constant across the whole run
+
+    Output:
+      - done: bool (True when there is NO next page)
+      - next_url: str | None (pass this into the next invocation)
+      - page_index: int (the next page index to use)
+      - run_date: str (YYYY-MM-DD)
+      - pages_saved: int (always 1 unless there was no data)
+      - s3_prefix: str
+    """
     event = event or {}
 
     bucket_name = os.environ.get("KLAVIYO_PROFILES_BUCKET")
     if not bucket_name:
         raise ValueError("Missing KLAVIYO_PROFILES_BUCKET environment variable")
 
-    # Use a fixed run_date for a whole export, so later invocations
-    # for the same run keep writing into the same prefix.
+    # One export run == one date prefix
     run_date = event.get("run_date") or time.strftime("%Y-%m-%d")
     prefix = f"profiles/{run_date}"
 
@@ -146,12 +168,14 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
         raise ValueError(f"Secret {SECRET_NAME} did not return an API key")
     session = make_session(api_key)
 
-    # If we were given a next_url, continue from there; otherwise start from scratch
+    # Decide which URL to hit
     url_from_event = event.get("next_url")
     if url_from_event:
+        # Continue from previous page
         url = url_from_event
-        params: Optional[Dict[str, Any]] = None  # next links are fully-formed
+        params: Optional[Dict[str, Any]] = None  # full URL already includes query string
     else:
+        # First page
         url = "https://a.klaviyo.com/api/profiles/"
         params = {
             "page[size]": str(PAGE_SIZE),
@@ -168,11 +192,11 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
 
     data = payload.get("data") or []
     if not data:
-        print("[INFO] No more profiles; finishing.")
+        print("[INFO] No profiles returned on this page; finishing.")
         return {
             "done": True,
             "next_url": None,
-            "page_index": page_index,
+            "page_index": page_index,  # unchanged
             "pages_saved": 0,
             "run_date": run_date,
             "s3_prefix": f"s3://{bucket_name}/{prefix}/",
@@ -183,6 +207,7 @@ def handler(event: Optional[Dict[str, Any]] = None, _context: Any = None) -> Dic
 
     next_url = (payload.get("links") or {}).get("next")
 
+    # This output is shaped so the **next** invocation can just receive it as input.
     return {
         "done": not bool(next_url),
         "next_url": next_url,
