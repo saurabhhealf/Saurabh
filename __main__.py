@@ -1,3 +1,5 @@
+import json
+
 import pulumi
 import pulumi_aws as aws
 
@@ -106,6 +108,23 @@ profiles_lambda = aws.lambda_.Function(
         variables={
             "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
         }
+    ),
+)
+
+aws.iam.RolePolicy(
+    "profilesSelfInvoke",
+    role=profiles_role.id,
+    policy=profiles_lambda.arn.apply(
+        lambda arn: json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "lambda:InvokeFunction",
+                    "Resource": [arn, f"{arn}:*"],
+                }
+            ],
+        })
     ),
 )
 
