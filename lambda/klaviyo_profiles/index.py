@@ -3,7 +3,7 @@ import json
 import os
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import boto3
@@ -12,7 +12,9 @@ import requests
 # --- Configuration ---
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-MAX_PAGES_PER_RUN = 50  # Stop after 50 pages and restart to prevent timeout
+# We only want 1 minute of data, so we likely won't need many pages. 
+# But we keep a safety limit just in case.
+MAX_PAGES_SAFETY_LIMIT = 20  
 REQUEST_TIMEOUT = (10, 60)
 
 # Custom fields to flatten
@@ -28,7 +30,6 @@ BUCKET_NAME = os.environ.get("KLAVIYO_PROFILES_BUCKET")
 
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
-_lambda_client = boto3.client("lambda")
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
@@ -110,90 +111,117 @@ def save_payload(bucket: str, key: str, data: Dict) -> None:
     _s3_client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode("utf-8"))
 
 
-def invoke_next_lambda(function_name: str, next_url: str, next_page_index: int, run_id: str):
-    """
-    Trigger the SAME Lambda asynchronously to continue the job.
-    """
-    payload = {
-        "next_url": next_url,
-        "page_index": next_page_index,
-        "run_id": run_id
-    }
-    print(f"[RECURSION] Invoking self for page {next_page_index}...")
-    _lambda_client.invoke(
-        FunctionName=function_name,
-        InvocationType='Event',  # Asynchronous - fire and forget
-        Payload=json.dumps(payload)
-    )
+def parse_klaviyo_date(date_str: str) -> datetime:
+    """Helper to parse ISO strings like '2025-12-16T12:00:00+00:00' or '...Z' to UTC"""
+    if date_str.endswith('Z'):
+        date_str = date_str[:-1] + '+00:00'
+    dt = datetime.fromisoformat(date_str)
+    return dt.astimezone(timezone.utc)
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # 1. Setup Context
-    run_id = event.get("run_id")
-    if not run_id:
-        # UPDATED: Name is just UTC timestamp now (e.g. "2025-12-17_14-30-00")
-        run_id = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-        print(f"[START] Starting NEW full profile dump. Run ID: {run_id}")
-
-    # 2. Determine Start Position
-    url = event.get("next_url") or "https://a.klaviyo.com/api/profiles/"
-    page_index = event.get("page_index") or 1
+    # 1. Define "Last Minute" Window
+    # End = Now (UTC)
+    # Start = Now - 1 Minute
+    end_ts = datetime.now(timezone.utc)
+    start_ts = end_ts - timedelta(minutes=1)
     
-    # Params are only needed for the very first call.
-    params = None
-    if not event.get("next_url"):
-        params = {
-            "page[size]": str(PAGE_SIZE),
-            "sort": "-updated", 
-            "additional-fields[profile]": "subscriptions"
-        }
+    # Run ID is simply the current timestamp
+    run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
+    
+    print(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
+    print(f"[INFO] Run ID: {run_id}")
 
-    # 3. Initialize Connections
+    # 2. Setup
     if not BUCKET_NAME:
         raise ValueError("Environment variable KLAVIYO_PROFILES_BUCKET is missing.")
         
     api_key = get_api_key()
     session = make_session(api_key)
-    pages_processed_this_run = 0
 
-    print(f"[INFO] Processing Run '{run_id}' | Starting at Page {page_index}")
+    url = "https://a.klaviyo.com/api/profiles/"
+    params = {
+        "page[size]": str(PAGE_SIZE),
+        "sort": "-updated", # Newest first is critical for this strategy
+        "additional-fields[profile]": "subscriptions"
+    }
 
-    # 4. Processing Loop
+    page_index = 1
+    total_profiles_saved = 0
+    stop_fetching = False
+
+    # 3. Processing Loop
     while True:
-        # Check Limits
-        if pages_processed_this_run >= MAX_PAGES_PER_RUN:
-            print(f"[LIMIT] Reached {MAX_PAGES_PER_RUN} pages. Recursing...")
-            invoke_next_lambda(context.function_name, url, page_index, run_id)
-            return {"status": "continued", "next_page": page_index}
+        if page_index > MAX_PAGES_SAFETY_LIMIT:
+            print(f"[LIMIT] Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
+            break
 
-        # Fetch
         response = safe_get(session, url, params=params)
         payload = response.json()
         
-        # Flatten
         add_custom_columns(payload)
-        data = payload.get("data") or []
+        raw_data = payload.get("data") or []
 
-        if not data:
-            print("[FINISH] No more data returned. Job complete.")
+        if not raw_data:
+            print("[FINISH] No more data returned by API.")
             break
 
-        # Save
-        s3_key = f"profiles/{run_id}/page_{page_index}.json"
-        save_payload(BUCKET_NAME, s3_key, payload)
-        print(f"[SAVE] Saved {len(data)} profiles to {s3_key}")
+        valid_records = []
 
-        # Advance
-        pages_processed_this_run += 1
-        page_index += 1
+        # 4. Filter Loop
+        for record in raw_data:
+            updated_str = record.get("attributes", {}).get("updated")
+            if not updated_str:
+                continue
+
+            try:
+                record_dt = parse_klaviyo_date(updated_str)
+            except ValueError:
+                continue
+
+            # If record is newer than our "end_ts" (technically impossible if end_ts is NOW, 
+            # but good safety if clock skew exists), we skip it but keep scanning.
+            if record_dt > end_ts:
+                continue
+
+            # CRITICAL CHECK:
+            # If we see a record older than 1 minute ago, we STOP completely.
+            # Because the list is sorted by newest, everyone after this is also too old.
+            if record_dt < start_ts:
+                stop_fetching = True
+                break
+            
+            # If we are here, the record is within the last minute
+            valid_records.append(record)
+
+        # 5. Save Valid Records
+        if valid_records:
+            # Only save the filtered list
+            payload["data"] = valid_records
+            if "links" in payload: del payload["links"] # Clean up metadata
+            
+            s3_key = f"profiles/{run_id}/page_{page_index}.json"
+            save_payload(BUCKET_NAME, s3_key, payload)
+            
+            count = len(valid_records)
+            total_profiles_saved += count
+            print(f"[SAVE] Saved {count} profiles to {s3_key}")
         
-        # Next Link
-        next_link = (payload.get("links") or {}).get("next")
+        if stop_fetching:
+            print(f"[INFO] Reached profiles older than 1 minute ({start_ts}). Stopping.")
+            break
+
+        # 6. Pagination
+        next_link = (response.json().get("links") or {}).get("next")
         if not next_link:
-            print("[FINISH] No 'next' link provided. Job complete.")
             break
         
         url = next_link
         params = None 
+        page_index += 1
 
-    return {"status": "completed", "total_pages": page_index, "run_id": run_id}
+    return {
+        "status": "completed", 
+        "profiles_saved": total_profiles_saved, 
+        "run_id": run_id
+    }
