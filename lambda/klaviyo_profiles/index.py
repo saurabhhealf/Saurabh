@@ -138,7 +138,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     end_ts = datetime.now(timezone.utc)
     
     # --- CHANGED HERE ---
-    start_ts = end_ts - timedelta(hours=3) 
+    start_ts = end_ts - timedelta(hours=6) 
     # --------------------
 
     run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
