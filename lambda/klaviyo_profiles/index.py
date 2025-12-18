@@ -4,7 +4,7 @@ import os
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import boto3
 import requests
@@ -27,9 +27,12 @@ CUSTOM_PROFILE_PROPERTIES = {
 SECRET_NAME = "klaviyo"
 SECRET_KEY_NAME = "API_KEY"
 BUCKET_NAME = os.environ.get("KLAVIYO_PROFILES_BUCKET")
+BACKFILL_QUEUE_URL = os.environ.get("KLAVIYO_PROFILES_BACKFILL_QUEUE_URL")
+BACKFILL_GROUP_ID = "profiles-backfill"
 
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
+_sqs_client = boto3.client("sqs")
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
@@ -133,13 +136,92 @@ def parse_klaviyo_date(date_str: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def parse_iso_to_utc(date_str: str) -> datetime:
+    """Parse generic ISO string to UTC datetime."""
+    if date_str.endswith("Z"):
+        date_str = date_str[:-1] + "+00:00"
+    return datetime.fromisoformat(date_str).astimezone(timezone.utc)
+
+
+def get_trigger_time(event: Dict[str, Any]) -> datetime:
+    """Return the event trigger time in UTC, falling back to now."""
+    event_time = event.get("time")
+    if isinstance(event_time, str):
+        try:
+            if event_time.endswith("Z"):
+                event_time = event_time[:-1] + "+00:00"
+            return datetime.fromisoformat(event_time).astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, datetime]]:
+    """
+    If invoked via SQS backfill, return an explicit (start, end) window.
+    The queue body should be JSON with a `start` ISO timestamp.
+    """
+    records = event.get("Records")
+    if not isinstance(records, list) or not records:
+        return None
+
+    record = records[0]
+    if record.get("eventSource") != "aws:sqs":
+        return None
+
+    body = record.get("body")
+    if not isinstance(body, str):
+        return None
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+
+    start_raw = payload.get("start")
+    if not isinstance(start_raw, str):
+        return None
+
+    try:
+        start_ts = parse_iso_to_utc(start_raw)
+    except ValueError:
+        return None
+
+    end_ts = start_ts + timedelta(hours=1)
+    return start_ts, end_ts
+
+
+def enqueue_next_window(next_start: datetime) -> None:
+    """Send the next hour to the backfill queue if we have room to run."""
+    if not BACKFILL_QUEUE_URL:
+        print("[INFO] Backfill queue URL not configured; skipping enqueue.")
+        return
+
+    latest_full_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    if next_start >= latest_full_hour:
+        print(f"[INFO] Reached latest full hour ({latest_full_hour}); stopping backfill enqueue.")
+        return
+
+    body = json.dumps({"start": next_start.isoformat()})
+    _sqs_client.send_message(
+        QueueUrl=BACKFILL_QUEUE_URL,
+        MessageBody=body,
+        MessageGroupId=BACKFILL_GROUP_ID,
+        MessageDeduplicationId=body,  # deterministic dedupe for the same window
+    )
+    print(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # 1. Define Window: Last 1 Hours
-    end_ts = datetime.now(timezone.utc)
-    
-    # --- CHANGED HERE ---
-    start_ts = end_ts - timedelta(hours=1) 
-    # --------------------
+    # 1. Define Window: either backfill window from SQS or the previous full hour
+    backfill_window = extract_backfill_window(event)
+    if backfill_window:
+        start_ts, end_ts = backfill_window
+        print(f"[INFO] Backfill window requested via SQS: {start_ts} -> {end_ts}")
+    else:
+        trigger_time = get_trigger_time(event)
+        end_ts = trigger_time.replace(minute=0, second=0, microsecond=0)
+        start_ts = end_ts - timedelta(hours=1)
 
     run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
     
@@ -164,7 +246,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     total_profiles_saved = 0
     stop_fetching = False
     
-    # Increase safety limit for 3 hours of data (e.g. 1000 pages = 100,000 profiles)
+    # Increase safety limit for large windows (e.g. backfill)
     MAX_PAGES_SAFETY_LIMIT = 1000 
 
     # 3. Processing Loop
@@ -199,7 +281,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if record_dt > end_ts:
                 continue
 
-            # STOP if older than 3 hours
+            # Stop once we drop below the window start
             if record_dt < start_ts:
                 stop_fetching = True
                 break
@@ -232,6 +314,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         page_index += 1
         
         time.sleep(0.1)
+
+    if backfill_window:
+        enqueue_next_window(end_ts)
 
     return {
         "status": "completed", 
