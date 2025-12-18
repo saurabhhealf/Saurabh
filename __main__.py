@@ -97,6 +97,7 @@ profiles_backfill_queue = aws.sqs.Queue(
     name="profiles-backfill.fifo",
     fifo_queue=True,
     content_based_deduplication=True,
+    visibility_timeout_seconds=900,
 )
 
 aws.iam.RolePolicyAttachment(
