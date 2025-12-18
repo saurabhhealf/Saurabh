@@ -250,6 +250,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     MAX_PAGES_SAFETY_LIMIT = 1000 
 
     # 3. Processing Loop
+    print('enter our processing loop')
     while True:
         if page_index > MAX_PAGES_SAFETY_LIMIT:
             print(f"[LIMIT] Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
@@ -267,7 +268,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         valid_records = []
 
-        # 4. Filter Loop
+        print('filter loop')
         for record in raw_data:
             updated_str = record.get("attributes", {}).get("updated")
             if not updated_str:
@@ -299,9 +300,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             count = len(valid_records)
             total_profiles_saved += count
             print(f"[SAVE] Saved {count} profiles to {s3_key}")
+        else:
+            print(f"[INFO] No valid profiles found on page {page_index}.")
         
         if stop_fetching:
-            print(f"[INFO] Reached profiles older than 3 hours ({start_ts}). Stopping.")
+            print(f"[INFO] Reached the end of our time window ({start_ts}). Stopping.")
             break
 
         # 6. Pagination
