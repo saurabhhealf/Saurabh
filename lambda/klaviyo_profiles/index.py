@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import random
 import time
@@ -30,32 +31,27 @@ BUCKET_NAME = os.environ.get("KLAVIYO_PROFILES_BUCKET")
 BACKFILL_QUEUE_URL = os.environ.get("KLAVIYO_PROFILES_BACKFILL_QUEUE_URL")
 BACKFILL_GROUP_ID = "profiles-backfill"
 
-_secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
 _sqs_client = boto3.client("sqs")
-
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
     """Fetch API Key from AWS Secrets Manager."""
-    resp = _secrets_client.get_secret_value(SecretId=secret_name)
-    secret = resp.get("SecretString")
-    if secret is None:
-        binary_secret = resp.get("SecretBinary")
-        if binary_secret is None:
-            raise ValueError(f"Secret {secret_name} is empty.")
-        secret = base64.b64decode(binary_secret).decode("utf-8")
+    secrets_client = boto3.client("secretsmanager")
 
     try:
+        r = secrets_client.get_secret_value(SecretId=secret_name)
+        secret = r.get("SecretString")
         parsed = json.loads(secret)
-        if isinstance(parsed, dict):
-            return parsed.get(key_name) or parsed.get("api_key")
+        return parsed.get(key_name) or parsed.get("api_key")
     except json.JSONDecodeError:
         pass
     return secret
 
 
-def make_session(api_key: str) -> requests.Session:
-    """Create a reuseable HTTP session with standard headers."""
+def make_klaviyo_session(api_key: str) -> requests.Session:
+    """Create a re-useable HTTP session with standard headers."""
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
     session.mount("https://", adapter)
@@ -76,33 +72,33 @@ def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None)
     
     while True:
         try:
-            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             attempt += 1
             if attempt > max_retries: raise
             sleep_time = min(2 ** attempt, 30) + random.uniform(0, 1)
-            print(f"[WARN] Network error: {e}. Retrying in {sleep_time:.2f}s...")
+            logger.warning(f"Network error: {e}. Retrying in {sleep_time:.2f}s...")
             time.sleep(sleep_time)
             continue
 
         # Handle Rate Limits (429) specifically using the Retry-After header
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 10))
-            print(f"[WARN] Rate Limit Hit (429). Sleeping for {retry_after} seconds...")
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", 10))
+            logger.warning(f"Rate Limit Hit (429). Sleeping for {retry_after} seconds...")
             time.sleep(retry_after + 1) # Add 1s buffer
             continue
 
         # Handle other temporary server errors
-        if resp.status_code in [500, 502, 503, 504]:
+        if r.status_code in [500, 502, 503, 504]:
             attempt += 1
-            if attempt > max_retries: resp.raise_for_status()
+            if attempt > max_retries: r.raise_for_status()
             sleep_time = min(2 ** attempt, 30)
-            print(f"[WARN] Server Error {resp.status_code}. Retrying in {sleep_time}s...")
+            logger.warning(f"Server Error {r.status_code}. Retrying in {sleep_time}s...")
             time.sleep(sleep_time)
             continue
         
-        resp.raise_for_status()
-        return resp
+        r.raise_for_status()
+        return r
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
@@ -161,16 +157,12 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
     If invoked via SQS backfill, return an explicit (start, end) window.
     The queue body should be JSON with a `start` ISO timestamp.
     """
-    records = event.get("Records")
-    if not isinstance(records, list) or not records:
-        return None
-
-    record = records[0]
-    if record.get("eventSource") != "aws:sqs":
-        return None
-
-    body = record.get("body")
-    if not isinstance(body, str):
+    try:
+        record = event.get("Records")[0]
+        if record.get("eventSource") != "aws:sqs":
+            return None
+        body = record["body"]
+    except (TypeError, IndexError, KeyError, AttributeError):
         return None
 
     try:
@@ -179,14 +171,7 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
         return None
 
     start_raw = payload.get("start")
-    if not isinstance(start_raw, str):
-        return None
-
-    try:
-        start_ts = parse_iso_to_utc(start_raw)
-    except ValueError:
-        return None
-
+    start_ts = parse_iso_to_utc(start_raw)
     end_ts = start_ts + timedelta(hours=1)
     return start_ts, end_ts
 
@@ -194,12 +179,12 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
 def enqueue_next_window(next_start: datetime) -> None:
     """Send the next hour to the backfill queue if we have room to run."""
     if not BACKFILL_QUEUE_URL:
-        print("[INFO] Backfill queue URL not configured; skipping enqueue.")
+        logger.info("Backfill queue URL not configured; skipping enqueue.")
         return
 
     latest_full_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     if next_start >= latest_full_hour:
-        print(f"[INFO] Reached latest full hour ({latest_full_hour}); stopping backfill enqueue.")
+        logger.info(f"Reached latest full hour ({latest_full_hour}); stopping backfill enqueue.")
         return
 
     body = json.dumps({"start": next_start.isoformat()})
@@ -207,9 +192,9 @@ def enqueue_next_window(next_start: datetime) -> None:
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=body,
         MessageGroupId=BACKFILL_GROUP_ID,
-        MessageDeduplicationId=body,  # deterministic dedupe for the same window
+        MessageDeduplicationId=body,  # deterministic de-dupe for the same window
     )
-    print(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
+    logger.info(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -217,28 +202,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     backfill_window = extract_backfill_window(event)
     if backfill_window:
         start_ts, end_ts = backfill_window
-        print(f"[INFO] Backfill window requested via SQS: {start_ts} -> {end_ts}")
+        logger.info(f"Backfill window requested via SQS: {start_ts} -> {end_ts}")
     else:
         trigger_time = get_trigger_time(event)
         end_ts = trigger_time.replace(minute=0, second=0, microsecond=0)
         start_ts = end_ts - timedelta(hours=1)
-
-    run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
     
-    print(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
-    print(f"[INFO] Run ID: {run_id}")
-
-    # 2. Setup
-    if not BUCKET_NAME:
-        raise ValueError("Environment variable KLAVIYO_PROFILES_BUCKET is missing.")
+    logger.info(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
         
     api_key = get_api_key()
-    session = make_session(api_key)
+    klaviyo_session = make_klaviyo_session(api_key)
 
     url = "https://a.klaviyo.com/api/profiles/"
     params = {
         "page[size]": str(PAGE_SIZE),
-        "sort": "-updated", # Newest first
+        "sort": "-updated", # Newest first,
+        "filter": f"less-then(update,{end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')})",
         "additional-fields[profile]": "subscriptions"
     }
 
@@ -250,26 +229,28 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     MAX_PAGES_SAFETY_LIMIT = 1000 
 
     # 3. Processing Loop
-    print('enter our processing loop')
+    logger.info("enter our processing loop")
     while True:
         if page_index > MAX_PAGES_SAFETY_LIMIT:
-            print(f"[LIMIT] Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
+            logger.warning(f"Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
             break
 
-        response = safe_get(session, url, params=params)
+        response = safe_get(klaviyo_session, url, params=params)
         payload = response.json()
         
         add_custom_columns(payload)
         raw_data = payload.get("data") or []
-
+        logger.info(raw_data)
+        
         if not raw_data:
-            print("[FINISH] No more data returned by API.")
+            logger.info("[FINISH] No more data returned by API.")
             break
 
         valid_records = []
 
-        print('filter loop')
+        logger.info("filter loop")
         for record in raw_data:
+            logger.info(record)
             updated_str = record.get("attributes", {}).get("updated")
             if not updated_str:
                 continue
@@ -294,17 +275,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             payload["data"] = valid_records
             if "links" in payload: del payload["links"] 
             
-            s3_key = f"profiles/{run_id}/page_{page_index}.json"
+            s3_key = f"profiles/{end_ts.strftime('%Y-%m-%d_%H-%M-%S')}/page_{page_index}.json"
             save_payload(BUCKET_NAME, s3_key, payload)
             
             count = len(valid_records)
             total_profiles_saved += count
-            print(f"[SAVE] Saved {count} profiles to {s3_key}")
+            logger.info(f"[SAVE] Saved {count} profiles to {s3_key}")
         else:
-            print(f"[INFO] No valid profiles found on page {page_index}.")
+            logger.info(f"No valid profiles found on page {page_index}.")
         
         if stop_fetching:
-            print(f"[INFO] Reached the end of our time window ({start_ts}). Stopping.")
+            logger.info(f"Reached the end of our time window ({start_ts}). Stopping.")
             break
 
         # 6. Pagination
@@ -316,7 +297,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         params = None 
         page_index += 1
         
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     if backfill_window:
         enqueue_next_window(end_ts)
@@ -324,5 +305,4 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     return {
         "status": "completed", 
         "profiles_saved": total_profiles_saved, 
-        "run_id": run_id
     }
