@@ -50,7 +50,7 @@ def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME)
     return secret
 
 
-def make_session(api_key: str) -> requests.Session:
+def make_klaviyo_session(api_key: str) -> requests.Session:
     """Create a re-useable HTTP session with standard headers."""
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
@@ -216,13 +216,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         start_ts = end_ts - timedelta(hours=1)
     
     logger.info(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
-
-    # 2. Setup
-    if not BUCKET_NAME:
-        raise ValueError("Environment variable KLAVIYO_PROFILES_BUCKET is missing.")
         
     api_key = get_api_key()
-    session = make_session(api_key)
+    klaviyo_session = make_klaviyo_session(api_key)
 
     url = "https://a.klaviyo.com/api/profiles/"
     params = {
@@ -245,12 +241,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.warning(f"Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
             break
 
-        response = safe_get(session, url, params=params)
+        response = safe_get(klaviyo_session, url, params=params)
         payload = response.json()
         
         add_custom_columns(payload)
         raw_data = payload.get("data") or []
-
+        logger.info(raw_data)
+        
         if not raw_data:
             logger.info("[FINISH] No more data returned by API.")
             break
@@ -259,6 +256,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         logger.info("filter loop")
         for record in raw_data:
+            logger.info(record)
             updated_str = record.get("attributes", {}).get("updated")
             if not updated_str:
                 continue
