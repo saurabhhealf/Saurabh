@@ -217,7 +217,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     params = {
         "page[size]": str(PAGE_SIZE),
         "sort": "-updated", # Newest first,
-        "filter": f"less-then(update,{end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')})",
+        "filter": f"less-than(update,{end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')})",
         "additional-fields[profile]": "subscriptions"
     }
 
