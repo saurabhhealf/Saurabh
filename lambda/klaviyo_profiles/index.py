@@ -185,8 +185,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     For an hour [H:00:00, (H+1):00:00), we query Klaviyo as:
       greater-than(updated, H-1 second) AND less-than(updated, (H+1):00:00)
-    This effectively gives us:
-      H:00:00 <= updated < (H+1):00:00
     using only the allowed operators.
     """
 
@@ -203,27 +201,30 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     filter_lower_dt = start_ts - timedelta(seconds=1)
     filter_upper_dt = end_ts
 
-    filter_lower = filter_lower_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    filter_upper = filter_upper_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    # IMPORTANT: Use trailing 'Z', not '+00:00'
+    filter_lower = filter_lower_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    filter_upper = filter_upper_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # For logging / response
-    window_start_str = start_ts.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    window_end_str = end_ts.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    window_start_str = start_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    window_end_str = end_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     logger.info(f"[START] Window (logical): {window_start_str} to {window_end_str}")
-    logger.info(f"[FILTER] greater-than(updated,{filter_lower}), less-than(updated,{filter_upper})")
+    logger.info(
+        f"[FILTER RAW] less-than(updated,{filter_upper}),"
+        f"greater-than(updated,{filter_lower})"
+    )
 
     api_key = get_api_key()
     session = make_klaviyo_session(api_key)
     url = "https://a.klaviyo.com/api/profiles/"
 
-    # 2. Initial page params
     current_params = {
         "page[size]": str(PAGE_SIZE),
         "sort": "-updated",
-        # NOTE: datetimes are *unquoted*. Using comma = logical AND.
+        # Match SDK example: less-than first, greater-than second, no quotes
         "filter": (
-            f"greater-than(updated,{filter_lower}),"
-            f"less-than(updated,{filter_upper})"
+            f"less-than(updated,{filter_upper}),"
+            f"greater-than(updated,{filter_lower})"
         ),
         "additional-fields[profile]": "subscriptions",
     }
@@ -231,7 +232,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     page_index = 1
     total_saved = 0
 
-    # 3. Processing loop
     while True:
         if page_index > MAX_PAGES_SAFETY_LIMIT:
             logger.warning("Safety limit hit.")
@@ -245,7 +245,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not records:
             break
 
-        # 4. Save to S3
         folder = start_ts.strftime("%Y-%m-%d/%H")
         s3_key = f"profiles/{folder}/page_{page_index}.json"
         save_payload(BUCKET_NAME, s3_key, payload)
@@ -253,16 +252,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         total_saved += len(records)
         logger.info(f"Page {page_index}: Saved {len(records)} records.")
 
-        # 5. Pagination
         next_link = (payload.get("links") or {}).get("next")
         if not next_link:
             break
 
         url = next_link
-        current_params = None  # cursor URL already has all query params
+        current_params = None
         page_index += 1
 
-    # 6. Enqueue next backfill hour if applicable
     if backfill_win:
         enqueue_next_window(end_ts)
 
