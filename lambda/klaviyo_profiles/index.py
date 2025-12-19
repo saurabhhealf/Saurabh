@@ -13,9 +13,9 @@ import requests
 # --- Configuration ---
 API_REVISION = "2025-10-15"
 PAGE_SIZE = 100
-# Safety Limit: 50 pages = 5,000 profiles/minute. 
+# Safety Limit: 70 pages = 7,000 profiles/minute. 
 # This is plenty for "last 1 minute" unless you have massive spikes.
-MAX_PAGES_SAFETY_LIMIT = 50 
+MAX_PAGES_SAFETY_LIMIT = 70
 REQUEST_TIMEOUT = (10, 60)
 
 # Custom fields to flatten
@@ -188,7 +188,7 @@ def enqueue_next_window(next_start: datetime) -> None:
         return
     start_str = next_start.isoformat() # Get the timestamp string
     body = json.dumps({"start": start_str})
-    
+
     body = json.dumps({"start": next_start.isoformat()})
     _sqs_client.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
@@ -200,111 +200,91 @@ def enqueue_next_window(next_start: datetime) -> None:
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    # 1. Define Window: either backfill window from SQS or the previous full hour
+    # 1. Define the Strict 1-Hour Window
+    # If the event comes from SQS, it uses the provided 'start' time.
+    # Otherwise, it defaults to the previous full hour (Live mode).
     backfill_window = extract_backfill_window(event)
+    
     if backfill_window:
         start_ts, end_ts = backfill_window
-        logger.info(f"Backfill window requested via SQS: {start_ts} -> {end_ts}")
     else:
         trigger_time = get_trigger_time(event)
         end_ts = trigger_time.replace(minute=0, second=0, microsecond=0)
         start_ts = end_ts - timedelta(hours=1)
     
-    logger.info(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
+    # Format dates to ISO 8601 strings for the Klaviyo API filter
+    start_str = start_ts.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_str = end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    logger.info(f"[START] Processing window: {start_str} to {end_str}")
         
     api_key = get_api_key()
     klaviyo_session = make_klaviyo_session(api_key)
 
+    # Initial setup for the API call
     url = "https://a.klaviyo.com/api/profiles/"
+    
+    # 2. Strict API-Side Filtering
+    # and(greater-or-equal, less-than) ensures we get exactly 1 hour of data.
     params = {
         "page[size]": str(PAGE_SIZE),
-        "sort": "-updated", # Newest first,
-        "filter": f"less-than(updated,{end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')})",
+        "sort": "-updated", 
+        "filter": f"and(greater-or-equal(updated,{start_str}),less-than(updated,{end_str}))",
         "additional-fields[profile]": "subscriptions"
     }
 
     page_index = 1
     total_profiles_saved = 0
-    stop_fetching = False
     
-    # Increase safety limit for large windows (e.g. backfill)
-    MAX_PAGES_SAFETY_LIMIT = 1000 
-
     # 3. Processing Loop
-    logger.info("enter our processing loop")
+    logger.info("Entering processing loop...")
     while True:
+        # Safety check: Stop if we exceed the maximum allowed pages
         if page_index > MAX_PAGES_SAFETY_LIMIT:
-            logger.warning(f"Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
-            break
+            logger.warning(f"Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping execution.")
+            break 
 
+        # Fetch data from Klaviyo
         response = safe_get(klaviyo_session, url, params=params)
         payload = response.json()
         
+        # Flatten nested properties for easier analytics
         add_custom_columns(payload)
-        raw_data = payload.get("data") or []
-        logger.info(raw_data)
+        records = payload.get("data") or []
         
-        if not raw_data:
-            logger.info("[FINISH] No more data returned by API.")
+        # Exit loop if no records are returned
+        if not records:
+            logger.info("No records found (or end of data reached) for this window.")
             break
 
-        valid_records = []
-
-        logger.info("filter loop")
-        for record in raw_data:
-            logger.info(record)
-            updated_str = record.get("attributes", {}).get("updated")
-            if not updated_str:
-                continue
-
-            try:
-                record_dt = parse_klaviyo_date(updated_str)
-            except ValueError:
-                continue
-
-            if record_dt > end_ts:
-                continue
-
-            # Stop once we drop below the window start
-            if record_dt < start_ts:
-                stop_fetching = True
-                break
-            
-            valid_records.append(record)
-
-        # 5. Save Valid Records
-        if valid_records:
-            payload["data"] = valid_records
-            if "links" in payload: del payload["links"] 
-            
-            s3_key = f"profiles/{end_ts.strftime('%Y-%m-%d_%H-%M-%S')}/page_{page_index}.json"
-            save_payload(BUCKET_NAME, s3_key, payload)
-            
-            count = len(valid_records)
-            total_profiles_saved += count
-            logger.info(f"[SAVE] Saved {count} profiles to {s3_key}")
-        else:
-            logger.info(f"No valid profiles found on page {page_index}.")
+        # 4. Save to S3
+        # Data is partitioned by YYYY-MM-DD/HH for organized storage
+        folder_path = start_ts.strftime('%Y-%m-%d/%H')
+        s3_key = f"profiles/{folder_path}/page_{page_index}.json"
         
-        if stop_fetching:
-            logger.info(f"Reached the end of our time window ({start_ts}). Stopping.")
-            break
+        save_payload(BUCKET_NAME, s3_key, payload)
+        
+        total_profiles_saved += len(records)
+        logger.info(f"[SAVE] Saved {len(records)} profiles to {s3_key}")
 
-        # 6. Pagination
-        next_link = (response.json().get("links") or {}).get("next")
+        # 5. Handle Pagination
+        # Klaviyo provides a 'next' link; if it's missing, we are done.
+        next_link = (payload.get("links") or {}).get("next")
         if not next_link:
+            logger.info("No more pages available.")
             break
         
+        # Update URL for next iteration; 'params' are already included in next_link.
         url = next_link
         params = None 
         page_index += 1
-        
-        time.sleep(0.05)
 
+    # 6. Chain the next hour if this is a backfill process
     if backfill_window:
         enqueue_next_window(end_ts)
 
     return {
         "status": "completed", 
-        "profiles_saved": total_profiles_saved, 
+        "time_window": {"start": start_str, "end": end_str},
+        "profiles_saved": total_profiles_saved
     }
