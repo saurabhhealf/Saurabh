@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import random
 import time
@@ -33,6 +34,8 @@ BACKFILL_GROUP_ID = "profiles-backfill"
 _secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
 _sqs_client = boto3.client("sqs")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
@@ -81,14 +84,14 @@ def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None)
             attempt += 1
             if attempt > max_retries: raise
             sleep_time = min(2 ** attempt, 30) + random.uniform(0, 1)
-            print(f"[WARN] Network error: {e}. Retrying in {sleep_time:.2f}s...")
+            logger.warning(f"Network error: {e}. Retrying in {sleep_time:.2f}s...")
             time.sleep(sleep_time)
             continue
 
         # Handle Rate Limits (429) specifically using the Retry-After header
         if r.status_code == 429:
             retry_after = int(r.headers.get("Retry-After", 10))
-            print(f"[WARN] Rate Limit Hit (429). Sleeping for {retry_after} seconds...")
+            logger.warning(f"Rate Limit Hit (429). Sleeping for {retry_after} seconds...")
             time.sleep(retry_after + 1) # Add 1s buffer
             continue
 
@@ -97,7 +100,7 @@ def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None)
             attempt += 1
             if attempt > max_retries: r.raise_for_status()
             sleep_time = min(2 ** attempt, 30)
-            print(f"[WARN] Server Error {r.status_code}. Retrying in {sleep_time}s...")
+            logger.warning(f"Server Error {r.status_code}. Retrying in {sleep_time}s...")
             time.sleep(sleep_time)
             continue
         
@@ -194,12 +197,12 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
 def enqueue_next_window(next_start: datetime) -> None:
     """Send the next hour to the backfill queue if we have room to run."""
     if not BACKFILL_QUEUE_URL:
-        print("[INFO] Backfill queue URL not configured; skipping enqueue.")
+        logger.info("Backfill queue URL not configured; skipping enqueue.")
         return
 
     latest_full_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     if next_start >= latest_full_hour:
-        print(f"[INFO] Reached latest full hour ({latest_full_hour}); stopping backfill enqueue.")
+        logger.info(f"Reached latest full hour ({latest_full_hour}); stopping backfill enqueue.")
         return
 
     body = json.dumps({"start": next_start.isoformat()})
@@ -209,7 +212,7 @@ def enqueue_next_window(next_start: datetime) -> None:
         MessageGroupId=BACKFILL_GROUP_ID,
         MessageDeduplicationId=body,  # deterministic de-dupe for the same window
     )
-    print(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
+    logger.info(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -217,13 +220,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     backfill_window = extract_backfill_window(event)
     if backfill_window:
         start_ts, end_ts = backfill_window
-        print(f"[INFO] Backfill window requested via SQS: {start_ts} -> {end_ts}")
+        logger.info(f"Backfill window requested via SQS: {start_ts} -> {end_ts}")
     else:
         trigger_time = get_trigger_time(event)
         end_ts = trigger_time.replace(minute=0, second=0, microsecond=0)
         start_ts = end_ts - timedelta(hours=1)
     
-    print(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
+    logger.info(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
 
     # 2. Setup
     if not BUCKET_NAME:
@@ -247,10 +250,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     MAX_PAGES_SAFETY_LIMIT = 1000 
 
     # 3. Processing Loop
-    print('enter our processing loop')
+    logger.info("enter our processing loop")
     while True:
         if page_index > MAX_PAGES_SAFETY_LIMIT:
-            print(f"[LIMIT] Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
+            logger.warning(f"Hit safety limit of {MAX_PAGES_SAFETY_LIMIT} pages. Stopping.")
             break
 
         response = safe_get(session, url, params=params)
@@ -260,12 +263,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         raw_data = payload.get("data") or []
 
         if not raw_data:
-            print("[FINISH] No more data returned by API.")
+            logger.info("[FINISH] No more data returned by API.")
             break
 
         valid_records = []
 
-        print('filter loop')
+        logger.info("filter loop")
         for record in raw_data:
             updated_str = record.get("attributes", {}).get("updated")
             if not updated_str:
@@ -291,17 +294,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             payload["data"] = valid_records
             if "links" in payload: del payload["links"] 
             
-            s3_key = f"profiles/{end_ts.strftime("%Y-%m-%d_%H-%M-%S")}/page_{page_index}.json"
+            s3_key = f"profiles/{end_ts.strftime('%Y-%m-%d_%H-%M-%S')}/page_{page_index}.json"
             save_payload(BUCKET_NAME, s3_key, payload)
             
             count = len(valid_records)
             total_profiles_saved += count
-            print(f"[SAVE] Saved {count} profiles to {s3_key}")
+            logger.info(f"[SAVE] Saved {count} profiles to {s3_key}")
         else:
-            print(f"[INFO] No valid profiles found on page {page_index}.")
+            logger.info(f"No valid profiles found on page {page_index}.")
         
         if stop_fetching:
-            print(f"[INFO] Reached the end of our time window ({start_ts}). Stopping.")
+            logger.info(f"Reached the end of our time window ({start_ts}). Stopping.")
             break
 
         # 6. Pagination
