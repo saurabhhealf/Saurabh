@@ -113,6 +113,9 @@ def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None)
 
 
 def parse_iso_to_utc(date_str: str) -> datetime:
+    """
+    Accepts BOTH ...Z and ...+00:00 etc, returns aware UTC datetime.
+    """
     if date_str.endswith("Z"):
         date_str = date_str[:-1] + "+00:00"
     return datetime.fromisoformat(date_str).astimezone(timezone.utc)
@@ -129,13 +132,42 @@ def get_trigger_time(event: Dict[str, Any]) -> datetime:
 
 
 def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, datetime]]:
-    """Extract start/end for a backfill job from SQS message body."""
+    """
+    Extract start/end for a 1-hour backfill window.
+
+    Supports:
+      - Direct invocation: { "start": "2025-02-22T15:00:00+00:00" }
+      - SQS event: { "Records": [ { "body": "{\"start\":\"...\"}" } ] }
+    """
     try:
-        record = event.get("Records")[0]
-        payload = json.loads(record["body"])
-        start_ts = parse_iso_to_utc(payload.get("start"))
-        return start_ts, start_ts + timedelta(hours=1)
-    except Exception:
+        start_str = None
+
+        # SQS shape
+        if "Records" in event:
+            record = event["Records"][0]
+            body = record.get("body")
+            if isinstance(body, str):
+                payload = json.loads(body)
+            elif isinstance(body, dict):
+                payload = body
+            else:
+                payload = {}
+            start_str = payload.get("start")
+        else:
+            # Direct Lambda invoke
+            start_str = event.get("start")
+
+        if not start_str:
+            return None
+
+        start_ts = parse_iso_to_utc(start_str)
+
+        # Enforce exact 1-hour window aligned on the provided hour
+        start_ts = start_ts.replace(minute=0, second=0, microsecond=0)
+        end_ts = start_ts + timedelta(hours=1)
+        return start_ts, end_ts
+    except Exception as e:
+        logger.warning(f"extract_backfill_window failed: {e}")
         return None
 
 
@@ -183,9 +215,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Fetch all profiles updated in a strict 1-hour window.
 
-    For an hour [H:00:00, (H+1):00:00), we query Klaviyo as:
-      greater-than(updated, H-1 second) AND less-than(updated, (H+1):00:00)
-    using only the allowed operators.
+    - If event has a 'start' (direct or via SQS), we use that exact hour.
+    - Otherwise, we default to the *previous* full hour.
+
+    Window is [H:00:00, H+1:00:00), implemented as:
+      greater-than(updated, H:00:00 - 1s)
+      AND
+      less-than(updated, H+1:00:00)
     """
 
     # 1. Determine hour window
@@ -201,7 +237,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     filter_lower_dt = start_ts - timedelta(seconds=1)
     filter_upper_dt = end_ts
 
-    # IMPORTANT: Use trailing 'Z', not '+00:00'
+    # Use Z in filter (matches Klaviyo examples)
     filter_lower = filter_lower_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     filter_upper = filter_upper_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -218,10 +254,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     session = make_klaviyo_session(api_key)
     url = "https://a.klaviyo.com/api/profiles/"
 
+    # 2. Initial page params (1 Lambda = 1 hour)
     current_params = {
         "page[size]": str(PAGE_SIZE),
         "sort": "-updated",
-        # Match SDK example: less-than first, greater-than second, no quotes
+        # less-than first, greater-than second, no quotes
         "filter": (
             f"less-than(updated,{filter_upper}),"
             f"greater-than(updated,{filter_lower})"
@@ -232,6 +269,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     page_index = 1
     total_saved = 0
 
+    # 3. Processing loop
     while True:
         if page_index > MAX_PAGES_SAFETY_LIMIT:
             logger.warning("Safety limit hit.")
@@ -245,12 +283,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not records:
             break
 
-        folder = start_ts.strftime("%Y-%m-%d/%H")
+        # 👇 S3 folder naming: 2025-12-10_14-00-00/
+        folder = start_ts.strftime("%Y-%m-%d_%H-%M-%S")
         s3_key = f"profiles/{folder}/page_{page_index}.json"
+
         save_payload(BUCKET_NAME, s3_key, payload)
 
         total_saved += len(records)
-        logger.info(f"Page {page_index}: Saved {len(records)} records.")
+        logger.info(f"Page {page_index}: Saved {len(records)} records to {s3_key}.")
 
         next_link = (payload.get("links") or {}).get("next")
         if not next_link:
@@ -260,6 +300,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         current_params = None
         page_index += 1
 
+
+    # 4. Enqueue next backfill hour if applicable
     if backfill_win:
         enqueue_next_window(end_ts)
 
