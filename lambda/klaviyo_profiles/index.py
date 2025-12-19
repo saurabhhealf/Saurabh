@@ -283,7 +283,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not records:
             break
 
-        # 👇 S3 folder naming: 2025-12-10_14-00-00/
+        # S3 folder naming: 2025-06-21_15-00-00/
         folder = start_ts.strftime("%Y-%m-%d_%H-%M-%S")
         s3_key = f"profiles/{folder}/page_{page_index}.json"
 
@@ -300,10 +300,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         current_params = None
         page_index += 1
 
-
     # 4. Enqueue next backfill hour if applicable
-    if backfill_win:
-        enqueue_next_window(end_ts)
+    #    (DISABLED: we only want one hour per Lambda invocation)
+    # if backfill_win:
+    #     enqueue_next_window(end_ts)
 
     return {
         "status": "completed",
