@@ -157,16 +157,12 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
     If invoked via SQS backfill, return an explicit (start, end) window.
     The queue body should be JSON with a `start` ISO timestamp.
     """
-    records = event.get("Records")
-    if not isinstance(records, list) or not records:
-        return None
-
-    record = records[0]
-    if record.get("eventSource") != "aws:sqs":
-        return None
-
-    body = record.get("body")
-    if not isinstance(body, str):
+    try:
+        record = event.get("Records")[0]
+        if record.get("eventSource") != "aws:sqs":
+            return None
+        body = record["body"]
+    except (TypeError, IndexError, KeyError, AttributeError):
         return None
 
     try:
@@ -175,9 +171,6 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
         return None
 
     start_raw = payload.get("start")
-    if not isinstance(start_raw, str):
-        return None
-
     start_ts = parse_iso_to_utc(start_raw)
     end_ts = start_ts + timedelta(hours=1)
     return start_ts, end_ts
@@ -223,7 +216,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     url = "https://a.klaviyo.com/api/profiles/"
     params = {
         "page[size]": str(PAGE_SIZE),
-        "sort": "-updated", # Newest first
+        "sort": "-updated", # Newest first,
+        "filter": f"less-then(update,{end_ts.strftime('%Y-%m-%dT%H:%M:%SZ')})",
         "additional-fields[profile]": "subscriptions"
     }
 
