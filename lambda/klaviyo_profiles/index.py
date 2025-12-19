@@ -186,13 +186,15 @@ def enqueue_next_window(next_start: datetime) -> None:
     if next_start >= latest_full_hour:
         logger.info(f"Reached latest full hour ({latest_full_hour}); stopping backfill enqueue.")
         return
-
+    start_str = next_start.isoformat() # Get the timestamp string
+    body = json.dumps({"start": start_str})
+    
     body = json.dumps({"start": next_start.isoformat()})
     _sqs_client.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=body,
         MessageGroupId=BACKFILL_GROUP_ID,
-        MessageDeduplicationId=body,  # deterministic de-dupe for the same window
+        MessageDeduplicationId=start_str.replace(":", "-").replace("+", "Z"),  # deterministic de-dupe for the same window
     )
     logger.info(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
 
