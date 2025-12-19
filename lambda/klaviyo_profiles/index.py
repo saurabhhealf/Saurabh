@@ -37,10 +37,10 @@ _sqs_client = boto3.client("sqs")
 
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
     """Fetch API Key from AWS Secrets Manager."""
-    resp = _secrets_client.get_secret_value(SecretId=secret_name)
-    secret = resp.get("SecretString")
+    r = _secrets_client.get_secret_value(SecretId=secret_name)
+    secret = r.get("SecretString")
     if secret is None:
-        binary_secret = resp.get("SecretBinary")
+        binary_secret = r.get("SecretBinary")
         if binary_secret is None:
             raise ValueError(f"Secret {secret_name} is empty.")
         secret = base64.b64decode(binary_secret).decode("utf-8")
@@ -55,7 +55,7 @@ def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME)
 
 
 def make_session(api_key: str) -> requests.Session:
-    """Create a reuseable HTTP session with standard headers."""
+    """Create a re-useable HTTP session with standard headers."""
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
     session.mount("https://", adapter)
@@ -76,7 +76,7 @@ def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None)
     
     while True:
         try:
-            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             attempt += 1
             if attempt > max_retries: raise
@@ -86,23 +86,23 @@ def safe_get(session: requests.Session, url: str, params: Optional[Dict] = None)
             continue
 
         # Handle Rate Limits (429) specifically using the Retry-After header
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 10))
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", 10))
             print(f"[WARN] Rate Limit Hit (429). Sleeping for {retry_after} seconds...")
             time.sleep(retry_after + 1) # Add 1s buffer
             continue
 
         # Handle other temporary server errors
-        if resp.status_code in [500, 502, 503, 504]:
+        if r.status_code in [500, 502, 503, 504]:
             attempt += 1
-            if attempt > max_retries: resp.raise_for_status()
+            if attempt > max_retries: r.raise_for_status()
             sleep_time = min(2 ** attempt, 30)
-            print(f"[WARN] Server Error {resp.status_code}. Retrying in {sleep_time}s...")
+            print(f"[WARN] Server Error {r.status_code}. Retrying in {sleep_time}s...")
             time.sleep(sleep_time)
             continue
         
-        resp.raise_for_status()
-        return resp
+        r.raise_for_status()
+        return r
 
 
 def add_custom_columns(payload: Dict[str, Any]) -> None:
@@ -207,7 +207,7 @@ def enqueue_next_window(next_start: datetime) -> None:
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=body,
         MessageGroupId=BACKFILL_GROUP_ID,
-        MessageDeduplicationId=body,  # deterministic dedupe for the same window
+        MessageDeduplicationId=body,  # deterministic de-dupe for the same window
     )
     print(f"[ENQUEUE] Scheduled next backfill window starting at {next_start}")
 
@@ -222,11 +222,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         trigger_time = get_trigger_time(event)
         end_ts = trigger_time.replace(minute=0, second=0, microsecond=0)
         start_ts = end_ts - timedelta(hours=1)
-
-    run_id = end_ts.strftime("%Y-%m-%d_%H-%M-%S")
     
     print(f"[START] Fetching profiles updated between {start_ts} and {end_ts}")
-    print(f"[INFO] Run ID: {run_id}")
 
     # 2. Setup
     if not BUCKET_NAME:
@@ -294,7 +291,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             payload["data"] = valid_records
             if "links" in payload: del payload["links"] 
             
-            s3_key = f"profiles/{run_id}/page_{page_index}.json"
+            s3_key = f"profiles/{end_ts.strftime("%Y-%m-%d_%H-%M-%S")}/page_{page_index}.json"
             save_payload(BUCKET_NAME, s3_key, payload)
             
             count = len(valid_records)
@@ -324,5 +321,4 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     return {
         "status": "completed", 
         "profiles_saved": total_profiles_saved, 
-        "run_id": run_id
     }
