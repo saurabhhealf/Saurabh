@@ -31,27 +31,20 @@ BUCKET_NAME = os.environ.get("KLAVIYO_PROFILES_BUCKET")
 BACKFILL_QUEUE_URL = os.environ.get("KLAVIYO_PROFILES_BACKFILL_QUEUE_URL")
 BACKFILL_GROUP_ID = "profiles-backfill"
 
-_secrets_client = boto3.client("secretsmanager")
 _s3_client = boto3.client("s3")
 _sqs_client = boto3.client("sqs")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
 def get_api_key(secret_name: str = SECRET_NAME, key_name: str = SECRET_KEY_NAME) -> str:
     """Fetch API Key from AWS Secrets Manager."""
-    r = _secrets_client.get_secret_value(SecretId=secret_name)
-    secret = r.get("SecretString")
-    if secret is None:
-        binary_secret = r.get("SecretBinary")
-        if binary_secret is None:
-            raise ValueError(f"Secret {secret_name} is empty.")
-        secret = base64.b64decode(binary_secret).decode("utf-8")
+    secrets_client = boto3.client("secretsmanager")
 
     try:
+        r = secrets_client.get_secret_value(SecretId=secret_name)
+        secret = r.get("SecretString")
         parsed = json.loads(secret)
-        if isinstance(parsed, dict):
-            return parsed.get(key_name) or parsed.get("api_key")
+        return parsed.get(key_name) or parsed.get("api_key")
     except json.JSONDecodeError:
         pass
     return secret
@@ -185,11 +178,7 @@ def extract_backfill_window(event: Dict[str, Any]) -> Optional[Tuple[datetime, d
     if not isinstance(start_raw, str):
         return None
 
-    try:
-        start_ts = parse_iso_to_utc(start_raw)
-    except ValueError:
-        return None
-
+    start_ts = parse_iso_to_utc(start_raw)
     end_ts = start_ts + timedelta(hours=1)
     return start_ts, end_ts
 
@@ -316,7 +305,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         params = None 
         page_index += 1
         
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     if backfill_window:
         enqueue_next_window(end_ts)
