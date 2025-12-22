@@ -41,9 +41,8 @@ secrets_read_policy = """{
     ]
 }"""
 
-# Events resources
+# --- Events Resources ---
 events_bucket = aws.s3.Bucket("klaviyo-events-bucket")
-
 events_role = aws.iam.Role("eventsLambdaRole", assume_role_policy=assume_role_policy)
 
 aws.iam.RolePolicyAttachment(
@@ -75,9 +74,8 @@ events_lambda = aws.lambda_.Function(
     ),
 )
 
-# Profiles resources
+# --- Profiles Resources ---
 profiles_bucket = aws.s3.Bucket("klaviyo-profiles-bucket")
-
 profiles_role = aws.iam.Role("profilesLambdaRole", assume_role_policy=assume_role_policy)
 
 aws.iam.RolePolicyAttachment(
@@ -92,6 +90,7 @@ aws.iam.RolePolicy(
     policy=secrets_read_policy,
 )
 
+# Keep the queue for manual ingestion if needed, but we will not link it to the Lambda
 profiles_backfill_queue = aws.sqs.Queue(
     "profilesBackfillQueue",
     name="profiles-backfill.fifo",
@@ -100,27 +99,12 @@ profiles_backfill_queue = aws.sqs.Queue(
     visibility_timeout_seconds=900,
 )
 
+# RECURSION REMOVAL: We only keep basic SQS execution logs if needed, 
+# but we DO NOT attach the EventSourceMapping or SendMessage policy.
 aws.iam.RolePolicyAttachment(
     "profilesSQSPolicy",
     role=profiles_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
-)
-
-aws.iam.RolePolicy(
-    "profilesSQSSendPolicy",
-    role=profiles_role.id,
-    policy=pulumi.Output.all(profiles_backfill_queue.arn).apply(
-        lambda args: f"""{{
-    "Version": "2012-10-17",
-    "Statement": [
-        {{
-            "Effect": "Allow",
-            "Action": ["sqs:SendMessage"],
-            "Resource": "{args[0]}"
-        }}
-    ]
-}}"""
-    ),
 )
 
 profiles_lambda = aws.lambda_.Function(
@@ -137,42 +121,20 @@ profiles_lambda = aws.lambda_.Function(
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
+            # Pass the URL but the Lambda code will no longer use it to send messages
             "KLAVIYO_PROFILES_BACKFILL_QUEUE_URL": profiles_backfill_queue.url,
         }
     ),
 )
 
-aws.lambda_.EventSourceMapping(
-    "profilesBackfillSQSEventSource",
-    event_source_arn=profiles_backfill_queue.arn,
-    function_name=profiles_lambda.arn,
-    batch_size=1,
-)
-
-profiles_cron_rule = aws.cloudwatch.EventRule(
-    "klaviyo_profiles_cron",
-    schedule_expression="cron(15 * * * ? *)",
-)
-
-aws.cloudwatch.EventTarget(
-    "profilesCronTarget",
-    rule=profiles_cron_rule.name,
-    arn=profiles_lambda.arn,
-)
-
-aws.lambda_.Permission(
-    "profilesCronInvokePermission",
-    action="lambda:InvokeFunction",
-    function=profiles_lambda.name,
-    principal="events.amazonaws.com",
-    source_arn=profiles_cron_rule.arn,
-)
+# DELETED: profilesBackfillSQSEventSource (Stops SQS from auto-triggering Lambda)
+# DELETED: profiles_cron_rule (Stops hourly automated runs)
+# DELETED: profilesCronTarget (Stops EventBridge connection)
+# DELETED: profilesCronInvokePermission (Stops external permission to invoke)
+# DELETED: profilesSQSSendPolicy (Stops Lambda from physically being able to trigger a loop)
 
 pulumi.export("events_bucket_name", events_bucket.bucket)
 pulumi.export("events_lambda_function_name", events_lambda.name)
 pulumi.export("profiles_bucket_name", profiles_bucket.bucket)
 pulumi.export("profiles_lambda_function_name", profiles_lambda.name)
-pulumi.export("profiles_cron_rule_arn", profiles_cron_rule.arn)
-pulumi.export("profiles_backfill_queue_name", profiles_backfill_queue.name)
-pulumi.export("profiles_backfill_queue_arn", profiles_backfill_queue.arn)
 pulumi.export("profiles_backfill_queue_url", profiles_backfill_queue.url)
