@@ -42,14 +42,14 @@ secrets_read_policy = """{
   ]
 }"""
 
-<<<<<<< HEAD
+
 # =========================
 # Existing Klaviyo (unchanged)
 # =========================
 
-=======
+
 # --- Events Resources ---
->>>>>>> 7981f902f3f19901982ab39712d7dca5f65f3e2c
+
 events_bucket = aws.s3.Bucket("klaviyo-events-bucket")
 events_role = aws.iam.Role("eventsLambdaRole", assume_role_policy=assume_role_policy)
 
@@ -73,10 +73,9 @@ events_lambda = aws.lambda_.Function(
     ),
 )
 
-<<<<<<< HEAD
-=======
+
 # --- Profiles Resources ---
->>>>>>> 7981f902f3f19901982ab39712d7dca5f65f3e2c
+
 profiles_bucket = aws.s3.Bucket("klaviyo-profiles-bucket")
 profiles_role = aws.iam.Role("profilesLambdaRole", assume_role_policy=assume_role_policy)
 
@@ -104,7 +103,7 @@ aws.iam.RolePolicyAttachment(
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
 )
 
-<<<<<<< HEAD
+
 aws.iam.RolePolicy(
     "profilesSQSSendPolicy",
     role=profiles_role.id,
@@ -120,8 +119,7 @@ aws.iam.RolePolicy(
     ),
 )
 
-=======
->>>>>>> 7981f902f3f19901982ab39712d7dca5f65f3e2c
+
 profiles_lambda = aws.lambda_.Function(
     "klaviyo-profile-grab-lambda",
     role=profiles_role.arn,
