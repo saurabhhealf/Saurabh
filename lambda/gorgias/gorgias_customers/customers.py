@@ -50,26 +50,38 @@ def get_secret_string(secret_name: str) -> str:
     return r["SecretBinary"].decode("utf-8")
 
 
-def get_gorgias_auth() -> tuple[str, str]:
-    global _cached_key
-    if _cached_key:
-        return (_cached_key, "")
+_cached_email = None
+_cached_key = None
 
+def get_gorgias_auth() -> tuple[str, str]:
+    global _cached_email, _cached_key
+    if _cached_email and _cached_key:
+        return (_cached_email, _cached_key)
+
+    email_raw = get_secret_string(SECRET_GORGIAS_EMAIL).strip()
     key_raw = get_secret_string(SECRET_GORGIAS_API_KEY).strip()
 
-    # handle JSON-wrapped secret
+    # If secrets are JSON, unwrap common shapes
     try:
-        key_obj = json.loads(key_raw)
-        if isinstance(key_obj, dict):
-            key_raw = (key_obj.get("value") or key_obj.get("api_key") or key_obj.get("key") or key_raw).strip()
+        obj = json.loads(email_raw)
+        if isinstance(obj, dict):
+            email_raw = (obj.get("value") or obj.get("email") or email_raw).strip()
     except Exception:
         pass
 
-    if not key_raw:
-        raise RuntimeError("Gorgias api key secret is empty")
+    try:
+        obj = json.loads(key_raw)
+        if isinstance(obj, dict):
+            key_raw = (obj.get("value") or obj.get("api_key") or obj.get("key") or key_raw).strip()
+    except Exception:
+        pass
 
-    _cached_key = key_raw
-    return (_cached_key, "")
+    if not email_raw or not key_raw:
+        raise RuntimeError("Gorgias email/api key secrets are empty")
+
+    _cached_email, _cached_key = email_raw, key_raw
+    return (_cached_email, _cached_key)
+
 
 
 
@@ -92,7 +104,7 @@ def make_session() -> requests.Session:
 def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{GORGIAS_BASE_URL}{path}"
     auth = get_gorgias_auth()
-    logger.info(f"[{STREAM_NAME}] Using api_key length={len(auth[0])}")
+    logger.info(f"[{STREAM_NAME}] auth email_present={bool(auth[0])} api_key_len={len(auth[1])}")
     while True:
         r = session.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
 
