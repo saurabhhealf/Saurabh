@@ -258,11 +258,11 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     return queue, fn
 
 
-gorgias_tickets_q, gorgias_tickets_fn = make_gorgias_stream("tickets", "tickets.handler")
-gorgias_surveys_q, gorgias_surveys_fn = make_gorgias_stream("satisfaction_surveys", "satisfaction_surveys.handler")
-gorgias_customers_q, gorgias_customers_fn = make_gorgias_stream("customers", "customers.handler")
-gorgias_users_q, gorgias_users_fn = make_gorgias_stream("users", "users.handler")
-gorgias_messages_q, gorgias_messages_fn = make_gorgias_stream("messages", "messages.handler")
+gorgias_tickets_q, gorgias_tickets_fn = make_gorgias_stream("tickets", "gorgias_tickets.tickets.handler")
+gorgias_surveys_q, gorgias_surveys_fn = make_gorgias_stream("satisfaction_surveys", "gorgias_satisfaction_surveys.satisfaction_surveys.handler")
+gorgias_customers_q, gorgias_customers_fn = make_gorgias_stream("customers", "gorgias_customers.customers.handler")
+gorgias_users_q, gorgias_users_fn = make_gorgias_stream("users", "gorgias_users.users.handler")
+gorgias_messages_q, gorgias_messages_fn = make_gorgias_stream("messages", "gorgias_messages.messages.handler")
 
 
 # Exports (existing)
