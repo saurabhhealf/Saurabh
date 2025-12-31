@@ -4,7 +4,7 @@ import time
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
-
+import uuid
 import boto3
 import requests
 
@@ -148,12 +148,21 @@ def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
 
 
 def enqueue_next(body: Dict[str, Any]) -> None:
+    
+    
+    # Generate unique deduplication ID for FIFO queue
+    dedup_id = f"{STREAM_NAME}-{body.get('page_start', 0)}-{uuid.uuid4()}"
+    
     resp = _sqs.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=json.dumps(body),
         MessageGroupId=STREAM_NAME,
+        MessageDeduplicationId=dedup_id,
     )
-    logger.info(f"[{STREAM_NAME}] ENQUEUED message_id={resp.get('MessageId')} body={json.dumps(body)}")
+    logger.info(
+        f"[{STREAM_NAME}] ENQUEUED message_id={resp.get('MessageId')} "
+        f"dedup_id={dedup_id} body={json.dumps(body)}"
+    )
 
 
 
