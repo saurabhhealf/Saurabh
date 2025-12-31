@@ -52,21 +52,24 @@ def get_gorgias_auth() -> tuple[str, str]:
     key_raw = get_secret_string(SECRET_GORGIAS_API_KEY).strip()
 
     try:
-        email_obj = json.loads(email_raw)
-        if isinstance(email_obj, dict):
-            email_raw = (email_obj.get("value") or email_obj.get("email") or email_raw).strip()
+        obj = json.loads(email_raw)
+        if isinstance(obj, dict):
+            email_raw = obj.get("GORGIAS_EMAIL") or obj.get("email") or obj.get("value") or email_raw
     except Exception:
         pass
 
     try:
-        key_obj = json.loads(key_raw)
-        if isinstance(key_obj, dict):
-            key_raw = (key_obj.get("value") or key_obj.get("api_key") or key_obj.get("key") or key_raw).strip()
+        obj = json.loads(key_raw)
+        if isinstance(obj, dict):
+            key_raw = obj.get("GORGIAS_API_KEY") or obj.get("api_key") or obj.get("key") or obj.get("value") or key_raw
     except Exception:
         pass
 
+    email_raw = str(email_raw).strip().strip('"').strip("'")
+    key_raw = str(key_raw).strip().strip('"').strip("'")
+
     if not email_raw or not key_raw:
-        raise RuntimeError("Gorgias email/api key secrets are empty")
+        raise RuntimeError("Gorgias email/api key secrets are empty after parsing")
 
     _cached_email, _cached_key = email_raw, key_raw
     return (_cached_email, _cached_key)
@@ -91,6 +94,7 @@ def make_session() -> requests.Session:
 def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{GORGIAS_BASE_URL}{path}"
     auth = get_gorgias_auth()
+    logger.info(f"[{STREAM_NAME}] auth email_present={bool(auth[0])} api_key_len={len(auth[1])}")
 
     while True:
         r = session.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
@@ -103,6 +107,7 @@ def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Di
 
         if r.status_code >= 400:
             logger.error(f"[{STREAM_NAME}] ERROR url={r.url} status={r.status_code} body={r.text[:1200]}")
+
         r.raise_for_status()
         return r.json()
 
@@ -165,7 +170,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     cursor = job.get("cursor")
     page_start = int(job.get("page_start", 1))
-    run_id = job.get("run_id") or datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
     direction = job.get("direction", DIRECTION_DEFAULT)
 
     cutoff = job.get("cutoff")
@@ -190,7 +194,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             break
 
         page_no = page_start + pages_written
-        s3_key = f"{S3_PREFIX_BASE}/satisfaction_surveys/{run_id}/page_{page_no}.json"
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        s3_key = f"{S3_PREFIX_BASE}/satisfaction_surveys/page_{page_no}_{ts}.json"
         s3_put_json(s3_key, payload)
 
         pages_written += 1
@@ -208,10 +213,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             {
                 "cursor": next_cursor,
                 "page_start": page_start + pages_written,
-                "run_id": run_id,
                 "cutoff": cutoff,
                 "direction": direction,
             }
         )
 
-    return {"stream": STREAM_NAME, "run_id": run_id, "pages_written": pages_written, "continued": bool(next_cursor)}
+    return {
+        "stream": STREAM_NAME,
+        "pages_written": pages_written,
+        "continued": bool(next_cursor),
+    }

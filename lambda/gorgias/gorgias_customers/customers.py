@@ -222,7 +222,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             break
 
         page_no = page_start + pages_written
-        s3_key = f"{S3_PREFIX_BASE}/customers/{run_id}/page_{page_no}.json"
+        s3_key = f"{S3_PREFIX_BASE}/customers/page_{page_no}.json"
+
         s3_put_json(s3_key, payload)
 
         pages_written += 1
