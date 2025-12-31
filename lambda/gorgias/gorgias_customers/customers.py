@@ -58,29 +58,47 @@ def get_gorgias_auth() -> tuple[str, str]:
     if _cached_email and _cached_key:
         return (_cached_email, _cached_key)
 
+    # email secret can be plaintext OR JSON key/value
     email_raw = get_secret_string(SECRET_GORGIAS_EMAIL).strip()
     key_raw = get_secret_string(SECRET_GORGIAS_API_KEY).strip()
 
-    # If secrets are JSON, unwrap common shapes
+    # If email secret is stored in "Key/value" format, unwrap
     try:
         obj = json.loads(email_raw)
         if isinstance(obj, dict):
-            email_raw = (obj.get("value") or obj.get("email") or email_raw).strip()
+            email_raw = (
+                obj.get("GORGIAS_EMAIL")
+                or obj.get("email")
+                or obj.get("value")
+                or email_raw
+            )
     except Exception:
         pass
 
+    # ✅ Your API key secret IS stored as Key/value with key "GORGIAS_API_KEY"
     try:
         obj = json.loads(key_raw)
         if isinstance(obj, dict):
-            key_raw = (obj.get("value") or obj.get("api_key") or obj.get("key") or key_raw).strip()
+            key_raw = (
+                obj.get("GORGIAS_API_KEY")
+                or obj.get("api_key")
+                or obj.get("key")
+                or obj.get("value")
+                or key_raw
+            )
     except Exception:
         pass
 
+    # cleanup quotes / whitespace
+    email_raw = str(email_raw).strip().strip('"').strip("'")
+    key_raw = str(key_raw).strip().strip('"').strip("'")
+
     if not email_raw or not key_raw:
-        raise RuntimeError("Gorgias email/api key secrets are empty")
+        raise RuntimeError("Gorgias email/api key secrets are empty after parsing")
 
     _cached_email, _cached_key = email_raw, key_raw
     return (_cached_email, _cached_key)
+
 
 
 
@@ -97,7 +115,7 @@ def parse_iso_utc(s: str) -> datetime:
 def make_session() -> requests.Session:
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
-    session.mount("https://", adapter)
+    session.mount("https://", adapter)cha
     return session
 
 
