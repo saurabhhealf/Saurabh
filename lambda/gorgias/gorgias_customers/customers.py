@@ -148,18 +148,23 @@ def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
 
 
 def enqueue_next(body: Dict[str, Any]) -> None:
-    _sqs.send_message(
+    resp = _sqs.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=json.dumps(body),
-        MessageGroupId=STREAM_NAME,  # keep same behavior (FIFO assumption)
+        MessageGroupId=STREAM_NAME,
     )
+    logger.info(f"[{STREAM_NAME}] ENQUEUED message_id={resp.get('MessageId')} body={json.dumps(body)}")
 
 
-def extract_job(event: Dict[str, Any]) -> Dict[str, Any]:
+
+def extract_job(event):
     if "Records" in event and event["Records"]:
+        rid = event["Records"][0].get("messageId")
         body = event["Records"][0].get("body", "{}")
+        logger.info(f"[{STREAM_NAME}] SQS record messageId={rid}")
         return json.loads(body) if isinstance(body, str) else body
     return event
+
 
 
 def time_budget_ok(context: Any, buffer_ms: int = 70_000) -> bool:
