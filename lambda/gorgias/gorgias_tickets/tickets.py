@@ -178,6 +178,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     session = make_session()
     pages_written = 0
     next_cursor = cursor
+    finish_reason: Optional[str] = None
 
     while pages_written < PAGES_PER_INVOCATION and time_budget_ok(context):
         params: Dict[str, Any] = {
@@ -188,38 +189,54 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             params["cursor"] = next_cursor
 
         payload = safe_get(session, ENDPOINT, params=params)
-        items = payload.get("data", [])
+        items = payload.get("data", []) or []
+
         if not items:
             next_cursor = None
+            finish_reason = "empty_page"
+            logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} page_start={page_start} cursor_present={bool(cursor)}")
             break
 
         page_no = page_start + pages_written
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        s3_key = f"{S3_PREFIX_BASE}/tickets/page_{page_no}_{ts}.json"
+        s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/page_{page_no}.json"
         s3_put_json(s3_key, payload)
 
+        api_next_cursor = (payload.get("meta") or {}).get("next_cursor")
+        logger.info(
+            f"[{STREAM_NAME}] WROTE page={page_no} items={len(items)} "
+            f"next_cursor_present={bool(api_next_cursor)} cutoff_present={bool(cutoff_dt)} s3_key={s3_key}"
+        )
+
         pages_written += 1
-        next_cursor = (payload.get("meta") or {}).get("next_cursor")
+        next_cursor = api_next_cursor
 
         if should_stop_by_cutoff(items, ORDER_BY_FIELD, direction, cutoff_dt):
             next_cursor = None
+            finish_reason = "cutoff_reached"
+            logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} last_page={page_no} cutoff={cutoff}")
             break
 
         if not next_cursor:
+            finish_reason = "no_next_cursor"
+            logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} last_page={page_no}")
             break
 
     if next_cursor:
-        enqueue_next(
-            {
-                "cursor": next_cursor,
-                "page_start": page_start + pages_written,
-                "cutoff": cutoff,
-                "direction": direction,
-            }
-        )
+        next_body = {
+            "cursor": next_cursor,
+            "page_start": page_start + pages_written,
+            "cutoff": cutoff,
+            "direction": direction,
+        }
+        logger.info(f"[{STREAM_NAME}] ENQUEUE {json.dumps(next_body)}")
+        enqueue_next(next_body)
 
-    return {
+    result = {
         "stream": STREAM_NAME,
         "pages_written": pages_written,
         "continued": bool(next_cursor),
+        "finish_reason": finish_reason,
+        "next_page_start": (page_start + pages_written) if next_cursor else None,
     }
+    logger.info(f"[{STREAM_NAME}] RESULT {json.dumps(result)}")
+    return result
