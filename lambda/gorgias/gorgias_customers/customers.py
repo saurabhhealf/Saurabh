@@ -115,7 +115,7 @@ def parse_iso_utc(s: str) -> datetime:
 def make_session() -> requests.Session:
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
-    session.mount("https://", adapter)cha
+    session.mount("https://", adapter)
     return session
 
 
