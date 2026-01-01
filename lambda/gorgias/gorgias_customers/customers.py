@@ -207,66 +207,106 @@ def should_stop_by_cutoff(items: List[Dict[str, Any]], field: str, direction: st
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    job = extract_job(event)
+    """
+    SQS-triggered Lambda handler.
 
-    cursor = job.get("cursor")
-    page_start = int(job.get("page_start", 1))
+    IMPORTANT:
+    - SQS can deliver multiple messages in a single Lambda invocation (event["Records"]).
+    - We MUST process all records, otherwise unprocessed records can be deleted when we return success.
+    """
+    records = event.get("Records", [])
 
-    session = make_session()
-    pages_written = 0
-    next_cursor = cursor
-    finish_reason: Optional[str] = None
+    # ✅ requested log line
+    logger.info(f"[{STREAM_NAME}] received_records={len(event.get('Records', []))}")
 
-    while pages_written < PAGES_PER_INVOCATION and time_budget_ok(context):
-        params: Dict[str, Any] = {
-            "limit": PAGE_SIZE,
-            "order_by": f"{ORDER_BY_FIELD}:{job.get('direction', DIRECTION_DEFAULT)}",
-        }
+    def process_one_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        cursor = job.get("cursor")
+        page_start = int(job.get("page_start", 1))
+
+        session = make_session()
+        pages_written = 0
+        next_cursor = cursor
+        finish_reason: Optional[str] = None
+
+        while pages_written < PAGES_PER_INVOCATION and time_budget_ok(context):
+            params: Dict[str, Any] = {
+                "limit": PAGE_SIZE,
+                "order_by": f"{ORDER_BY_FIELD}:{job.get('direction', DIRECTION_DEFAULT)}",
+            }
+            if next_cursor:
+                params["cursor"] = next_cursor
+
+            payload = safe_get(session, ENDPOINT, params=params)
+            items = payload.get("data", []) or []
+
+            if not items:
+                next_cursor = None
+                finish_reason = "empty_page"
+                logger.info(
+                    f"[{STREAM_NAME}] FINISHED reason={finish_reason} "
+                    f"page_start={page_start} cursor_present={bool(cursor)}"
+                )
+                break
+
+            page_no = page_start + pages_written
+            s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/page_{page_no}.json"
+            s3_put_json(s3_key, payload)
+
+            api_next_cursor = (payload.get("meta") or {}).get("next_cursor")
+            logger.info(
+                f"[{STREAM_NAME}] WROTE page={page_no} items={len(items)} "
+                f"next_cursor_present={bool(api_next_cursor)} s3_key={s3_key}"
+            )
+
+            pages_written += 1
+            next_cursor = api_next_cursor
+
+            if not next_cursor:
+                finish_reason = "no_next_cursor"
+                logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} last_page={page_no}")
+                break
+
         if next_cursor:
-            params["cursor"] = next_cursor
+            next_body = {
+                "cursor": next_cursor,
+                "page_start": page_start + pages_written,
+            }
+            logger.info(f"[{STREAM_NAME}] ENQUEUE {json.dumps(next_body)}")
+            enqueue_next(next_body)
+            finish_reason = None
 
-        payload = safe_get(session, ENDPOINT, params=params)
-        items = payload.get("data", []) or []
-
-        if not items:
-            next_cursor = None
-            finish_reason = "empty_page"
-            logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} page_start={page_start} cursor_present={bool(cursor)}")
-            break
-
-        page_no = page_start + pages_written
-        s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/page_{page_no}.json"
-        s3_put_json(s3_key, payload)
-
-        api_next_cursor = (payload.get("meta") or {}).get("next_cursor")
-        logger.info(
-            f"[{STREAM_NAME}] WROTE page={page_no} items={len(items)} "
-            f"next_cursor_present={bool(api_next_cursor)} s3_key={s3_key}"
-        )
-
-        pages_written += 1
-        next_cursor = api_next_cursor
-
-        if not next_cursor:
-            finish_reason = "no_next_cursor"
-            logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} last_page={page_no}")
-            break
-
-    if next_cursor:
-        next_body = {
-            "cursor": next_cursor,
-            "page_start": page_start + pages_written,
+        result = {
+            "stream": STREAM_NAME,
+            "pages_written": pages_written,
+            "continued": bool(next_cursor),
+            "finish_reason": finish_reason,
+            "next_page_start": (page_start + pages_written) if next_cursor else None,
         }
-        logger.info(f"[{STREAM_NAME}] ENQUEUE {json.dumps(next_body)}")
-        enqueue_next(next_body)
-        finish_reason = None
+        logger.info(f"[{STREAM_NAME}] RESULT {json.dumps(result)}")
+        return result
 
-    result = {
-        "stream": STREAM_NAME,
-        "pages_written": pages_written,
-        "continued": bool(next_cursor),
-        "finish_reason": finish_reason,
-        "next_page_start": (page_start + pages_written) if next_cursor else None,
-    }
-    logger.info(f"[{STREAM_NAME}] RESULT {json.dumps(result)}")
-    return result
+    # SQS invocation path
+    if records:
+        results: List[Dict[str, Any]] = []
+        for rec in records:
+            rid = rec.get("messageId")
+            body = rec.get("body", "{}")
+
+            logger.info(f"[{STREAM_NAME}] SQS record messageId={rid}")
+
+            try:
+                job = json.loads(body) if isinstance(body, str) else body
+            except Exception:
+                logger.exception(f"[{STREAM_NAME}] Failed to parse SQS body messageId={rid}")
+                raise
+
+            results.append(process_one_job(job))
+
+        return {"results": results}
+
+    # Manual invoke path (non-SQS)
+    if not isinstance(event, dict):
+        raise ValueError("Expected event to be a dict")
+
+    return process_one_job(event)
+
