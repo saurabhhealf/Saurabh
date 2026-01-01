@@ -154,20 +154,28 @@ def enqueue_next(body: Dict[str, Any]) -> None:
 
     page_start = int(body.get("page_start", 0))
 
-    dedup_id = f"{job_start_id}-page-{page_start}-{uuid.uuid4()}"
+    # FIFO: keep ordering per run
     group_id = f"{STREAM_NAME}-{job_start_id}"
+
+    # FIFO: must be unique within the 5-minute dedup window
+    dedup_id = f"{job_start_id}-page-{page_start}-{uuid.uuid4()}"
+
+    # ✅ key change: add delay to avoid Lambda recursion/loop detection
+    delay_seconds = int(body.get("delay_seconds", 3))  # tune 2–10 seconds
 
     resp = _sqs.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=json.dumps(body),
         MessageGroupId=group_id,
         MessageDeduplicationId=dedup_id,
+        DelaySeconds=delay_seconds,
     )
 
     logger.info(
         f"[{STREAM_NAME}] ENQUEUED message_id={resp.get('MessageId')} "
-        f"group_id={group_id} dedup_id={dedup_id} body={json.dumps(body)}"
+        f"group_id={group_id} dedup_id={dedup_id} delay_seconds={delay_seconds} body={json.dumps(body)}"
     )
+
 
 
 
@@ -281,6 +289,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "cursor": next_cursor,
                 "page_start": page_start + pages_written,
                 "job_start_id": job_start_id,
+                "delay_seconds": 3,
             }
             logger.info(f"[{STREAM_NAME}] ENQUEUE {json.dumps(next_body)}")
             enqueue_next(next_body)
