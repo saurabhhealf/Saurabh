@@ -2,7 +2,6 @@ import json
 import os
 import time
 import logging
-import gzip
 from typing import Any, Dict, Optional, List
 
 import boto3
@@ -33,7 +32,6 @@ DIRECTION_DEFAULT = "asc"
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 REQUEST_TIMEOUT = (10, 60)
 
-# Do more than 1 page per invocation if you want faster + fewer scheduler ticks
 PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "5"))
 SLEEP_BETWEEN_REQUESTS_SEC = float(os.environ.get("SLEEP_BETWEEN_REQUESTS_SEC", "0.0"))
 
@@ -47,7 +45,7 @@ _cached_key: Optional[str] = None
 
 def get_secret_string(secret_name: str) -> str:
     r = _secrets.get_secret_value(SecretId=secret_name)
-    if "SecretString" in r and r["SecretString"]:
+    if r.get("SecretString"):
         return r["SecretString"]
     return r["SecretBinary"].decode("utf-8")
 
@@ -112,15 +110,13 @@ def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Di
         return r.json()
 
 
-def s3_put_json_gz(key: str, payload: Dict[str, Any]) -> None:
+def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
     raw = json.dumps(payload).encode("utf-8")
-    gz = gzip.compress(raw)
     _s3.put_object(
         Bucket=S3_BUCKET,
         Key=key,
-        Body=gz,
+        Body=raw,
         ContentType="application/json",
-        ContentEncoding="gzip",
     )
 
 
@@ -150,12 +146,37 @@ def _release_lease(job_start_id: str) -> None:
 
 def _ddb_mark_done(job_start_id: str, expected_cursor: Optional[str], expected_page: int) -> None:
     now = int(time.time())
+
+    if expected_cursor is None:
+        cursor_condition = "attribute_not_exists(#cursor)"
+        eav = {
+            ":running": "RUNNING",
+            ":done": "DONE",
+            ":expected_page": expected_page,
+            ":true": True,
+            ":false": False,
+            ":zero": 0,
+            ":now": now,
+        }
+    else:
+        cursor_condition = "#cursor = :expected_cursor"
+        eav = {
+            ":running": "RUNNING",
+            ":done": "DONE",
+            ":expected_page": expected_page,
+            ":expected_cursor": expected_cursor,
+            ":true": True,
+            ":false": False,
+            ":zero": 0,
+            ":now": now,
+        }
+
     try:
         TABLE.update_item(
             Key={"job_start_id": job_start_id},
             ConditionExpression=(
                 "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
-                "((#cursor = :expected_cursor) OR (attribute_not_exists(#cursor) AND :cursor_is_null = :true))"
+                f"({cursor_condition})"
             ),
             UpdateExpression="SET #status = :done, #in_flight = :false, #lease_until = :zero, #updated_at = :now REMOVE #cursor",
             ExpressionAttributeNames={
@@ -166,39 +187,62 @@ def _ddb_mark_done(job_start_id: str, expected_cursor: Optional[str], expected_p
                 "#lease_until": "lease_until",
                 "#updated_at": "updated_at",
             },
-            ExpressionAttributeValues={
-                ":running": "RUNNING",
-                ":done": "DONE",
-                ":expected_page": expected_page,
-                ":expected_cursor": expected_cursor or "__MISSING__",
-                ":cursor_is_null": expected_cursor is None,
-                ":true": True,
-                ":false": False,
-                ":zero": 0,
-                ":now": now,
-            },
+            ExpressionAttributeValues=eav,
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(
-                f"[{STREAM_NAME}] DDB conditional failed (DONE). Likely duplicate/out-of-order. job={job_start_id}"
-            )
-            # Still release lease to avoid stuck RUNNING/in_flight
+            logger.warning(f"[{STREAM_NAME}] DDB conditional failed (DONE). Likely duplicate/out-of-order. job={job_start_id}")
             _release_lease(job_start_id)
             return
         raise
 
 
-def _ddb_update_progress(job_start_id: str, expected_cursor: Optional[str], expected_page: int, next_cursor: str, next_page: int) -> None:
+def _ddb_update_progress(
+    job_start_id: str,
+    expected_cursor: Optional[str],
+    expected_page: int,
+    next_cursor: str,
+    next_page: int,
+) -> None:
     now = int(time.time())
+
+    if expected_cursor is None:
+        cursor_condition = "attribute_not_exists(#cursor)"
+        eav = {
+            ":running": "RUNNING",
+            ":expected_page": expected_page,
+            ":true": True,
+            ":false": False,
+            ":next_cursor": next_cursor,
+            ":next_page": next_page,
+            ":zero": 0,
+            ":now": now,
+        }
+    else:
+        cursor_condition = "#cursor = :expected_cursor"
+        eav = {
+            ":running": "RUNNING",
+            ":expected_page": expected_page,
+            ":expected_cursor": expected_cursor,
+            ":true": True,
+            ":false": False,
+            ":next_cursor": next_cursor,
+            ":next_page": next_page,
+            ":zero": 0,
+            ":now": now,
+        }
+
     try:
         TABLE.update_item(
             Key={"job_start_id": job_start_id},
             ConditionExpression=(
                 "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
-                "((#cursor = :expected_cursor) OR (attribute_not_exists(#cursor) AND :cursor_is_null = :true))"
+                f"({cursor_condition})"
             ),
-            UpdateExpression="SET #cursor = :next_cursor, #page = :next_page, #in_flight = :false, #lease_until = :zero, #updated_at = :now REMOVE #last_error",
+            UpdateExpression=(
+                "SET #cursor = :next_cursor, #page = :next_page, #in_flight = :false, "
+                "#lease_until = :zero, #updated_at = :now REMOVE #last_error"
+            ),
             ExpressionAttributeNames={
                 "#status": "status",
                 "#page": "page",
@@ -208,25 +252,11 @@ def _ddb_update_progress(job_start_id: str, expected_cursor: Optional[str], expe
                 "#updated_at": "updated_at",
                 "#last_error": "last_error",
             },
-            ExpressionAttributeValues={
-                ":running": "RUNNING",
-                ":expected_page": expected_page,
-                ":expected_cursor": expected_cursor or "__MISSING__",
-                ":cursor_is_null": expected_cursor is None,
-                ":true": True,
-                ":false": False,
-                ":next_cursor": next_cursor,
-                ":next_page": next_page,
-                ":zero": 0,
-                ":now": now,
-            },
+            ExpressionAttributeValues=eav,
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(
-                f"[{STREAM_NAME}] DDB conditional failed (PROGRESS). Likely duplicate/out-of-order. job={job_start_id}"
-            )
-            # Release lease so orchestrator can re-drive safely
+            logger.warning(f"[{STREAM_NAME}] DDB conditional failed (PROGRESS). Likely duplicate/out-of-order. job={job_start_id}")
             _release_lease(job_start_id)
             return
         raise
@@ -262,17 +292,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"[{STREAM_NAME}] received_records={len(records)}")
 
     results: List[Dict[str, Any]] = []
+
     for rec in records:
         job = _parse_record(rec)
-
         job_start_id = job["job_start_id"]
 
-        # IMPORTANT: msg_* are the expected values in Dynamo for this SQS message.
-        # We NEVER mutate these, so conditional updates stay correct.
+        # Expected state from the SQS message (used for conditional updates)
         msg_cursor: Optional[str] = job.get("cursor")
         msg_page: int = int(job.get("page", 1))
 
-        # Local loop variables (we can mutate these freely)
+        # Local loop vars (mutable)
         cursor = msg_cursor
         page = msg_page
 
@@ -297,8 +326,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
                     break
 
-                s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/job={job_start_id}/page={page:06d}.json.gz"
-                s3_put_json_gz(s3_key, payload)
+                s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/job={job_start_id}/page={page:06d}.json"
+                s3_put_json(s3_key, payload)
 
                 logger.info(
                     f"[{STREAM_NAME}] WROTE job={job_start_id} page={page} items={len(items)} "
@@ -312,8 +341,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
                     break
 
-                # Update state ONCE per page using the ORIGINAL expected msg_* values.
-                # This is safe even with multi-page-per-invocation because orchestrator only enqueues 1 message at a time.
+                # Update DDB using the expected msg_* values
                 _ddb_update_progress(
                     job_start_id=job_start_id,
                     expected_cursor=msg_cursor,
@@ -322,11 +350,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     next_page=page + 1,
                 )
 
-                # After successful state update, our "message expected state" becomes the new state
+                # After successful state update, expected state becomes the new state
                 msg_cursor = api_next_cursor
                 msg_page = page + 1
 
-                # Advance local loop vars too
+                # Advance local vars
                 cursor = api_next_cursor
                 page = page + 1
 
@@ -337,6 +365,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.exception(f"[{STREAM_NAME}] ERROR job={job_start_id}")
             _ddb_record_error(job_start_id, str(e))
             raise
+        finally:
+            # Safety: if we never wrote a page (so no progress/done update released the lease),
+            # release it so orchestrator can retry quickly.
+            if pages_written == 0:
+                _release_lease(job_start_id)
 
         results.append({"job_start_id": job_start_id, "pages_written": pages_written})
 
