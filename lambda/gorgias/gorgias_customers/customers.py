@@ -148,22 +148,25 @@ def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
 
 
 def enqueue_next(body: Dict[str, Any]) -> None:
-    # job_start_id MUST be present in body
     job_start_id = body.get("job_start_id")
     if not job_start_id:
         raise RuntimeError("Missing job_start_id in enqueue body")
 
-    dedup_id = f"{STREAM_NAME}-{body.get('page_start', 0)}-{uuid.uuid4()}"
+    page_start = int(body.get("page_start", 0))
+
+    dedup_id = f"{job_start_id}-page-{page_start}-{uuid.uuid4()}"
+    group_id = f"{STREAM_NAME}-{job_start_id}"
 
     resp = _sqs.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=json.dumps(body),
-        MessageGroupId=f"{STREAM_NAME}-{job_start_id}",
+        MessageGroupId=group_id,
         MessageDeduplicationId=dedup_id,
     )
+
     logger.info(
         f"[{STREAM_NAME}] ENQUEUED message_id={resp.get('MessageId')} "
-        f"dedup_id={dedup_id} body={json.dumps(body)}"
+        f"group_id={group_id} dedup_id={dedup_id} body={json.dumps(body)}"
     )
 
 
@@ -223,7 +226,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"[{STREAM_NAME}] received_records={len(records)}")
 
     def process_one_job(job: Dict[str, Any]) -> Dict[str, Any]:
-        # ✅ create or reuse job_start_id PER JOB (not globally)
+        # Create or reuse job_start_id PER JOB
         job_start_id = job.get("job_start_id") or str(uuid.uuid4())
 
         cursor = job.get("cursor")
@@ -272,11 +275,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 logger.info(f"[{STREAM_NAME}] FINISHED reason={finish_reason} last_page={page_no}")
                 break
 
+        # Enqueue next page if we have a cursor
         if next_cursor:
             next_body = {
                 "cursor": next_cursor,
                 "page_start": page_start + pages_written,
-                "job_start_id": job_start_id,  # ✅ propagate
+                "job_start_id": job_start_id,
             }
             logger.info(f"[{STREAM_NAME}] ENQUEUE {json.dumps(next_body)}")
             enqueue_next(next_body)
@@ -288,9 +292,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "continued": bool(next_cursor),
             "finish_reason": finish_reason,
             "next_page_start": (page_start + pages_written) if next_cursor else None,
+            "job_start_id": job_start_id,  # helpful to log/trace
         }
         logger.info(f"[{STREAM_NAME}] RESULT {json.dumps(result)}")
         return result
+
 
     # SQS invocation path
     if records:
