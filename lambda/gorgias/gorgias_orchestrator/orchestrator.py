@@ -11,14 +11,31 @@ logger.setLevel(logging.INFO)
 
 _ddb = boto3.resource("dynamodb")
 _sqs = boto3.client("sqs")
+_events = boto3.client("events")
 
 STATE_TABLE = os.environ["STATE_TABLE"]
 QUEUE_URL = os.environ["BACKFILL_QUEUE_URL"]
+
+# NEW: rule name to disable on DONE
+ORCHESTRATOR_RULE_NAME = os.environ.get("ORCHESTRATOR_RULE_NAME", "").strip()
 
 VISIBILITY_TIMEOUT_SEC = int(os.environ.get("VISIBILITY_TIMEOUT_SEC", "300"))
 LEASE_BUFFER_SEC = int(os.environ.get("LEASE_BUFFER_SEC", "60"))
 
 TABLE = _ddb.Table(STATE_TABLE)
+
+
+def _disable_schedule_rule_if_configured(reason: str) -> None:
+    if not ORCHESTRATOR_RULE_NAME:
+        logger.warning(f"[orchestrator] ORCHESTRATOR_RULE_NAME not set; cannot disable schedule (reason={reason})")
+        return
+    try:
+        _events.disable_rule(Name=ORCHESTRATOR_RULE_NAME)
+        logger.info(f"[orchestrator] Disabled schedule rule '{ORCHESTRATOR_RULE_NAME}' (reason={reason})")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        # If it's already disabled or some race, just log it
+        logger.warning(f"[orchestrator] Failed to disable rule '{ORCHESTRATOR_RULE_NAME}': {code} {e}")
 
 
 def handler(event, context):
@@ -31,7 +48,9 @@ def handler(event, context):
     item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
     if not item:
         logger.warning(f"[orchestrator] state missing job={job_start_id}")
-        return {"enqueued": False, "reason": "missing_state"}
+        _disable_schedule_rule_if_configured(reason="missing_state")
+        return {"enqueued": False, "reason": "missing_state", "disabled_rule": bool(ORCHESTRATOR_RULE_NAME)}
+
 
     status = item.get("status")
     in_flight = bool(item.get("in_flight", False))
@@ -39,7 +58,20 @@ def handler(event, context):
     page = int(item.get("page", 1))
     cursor = item.get("cursor")  # may be missing/None
 
-    logger.info(f"[orchestrator] job={job_start_id} status={status} in_flight={in_flight} lease_until={lease_until} page={page}")
+    logger.info(
+        f"[orchestrator] job={job_start_id} status={status} in_flight={in_flight} "
+        f"lease_until={lease_until} page={page}"
+    )
+
+    # ✅ Auto-stop schedule when DONE (or any terminal state you choose)
+    if status == "DONE":
+        _disable_schedule_rule_if_configured(reason="job_done")
+        return {"enqueued": False, "reason": "status=DONE", "disabled_rule": bool(ORCHESTRATOR_RULE_NAME)}
+
+    # You can decide whether ERROR should also stop the schedule:
+    if status == "ERROR":
+        _disable_schedule_rule_if_configured(reason="job_error")
+        return {"enqueued": False, "reason": "status=ERROR", "disabled_rule": bool(ORCHESTRATOR_RULE_NAME)}
 
     if status != "RUNNING":
         return {"enqueued": False, "reason": f"status={status}"}
@@ -52,7 +84,10 @@ def handler(event, context):
     try:
         TABLE.update_item(
             Key={"job_start_id": job_start_id},
-            ConditionExpression="#status = :running AND (attribute_not_exists(#in_flight) OR #in_flight = :false OR #lease_until < :now)",
+            ConditionExpression=(
+                "#status = :running AND "
+                "(attribute_not_exists(#in_flight) OR #in_flight = :false OR #lease_until < :now)"
+            ),
             UpdateExpression="SET #in_flight = :true, #lease_until = :lease, #updated_at = :now",
             ExpressionAttributeNames={
                 "#status": "status",

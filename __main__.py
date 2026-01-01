@@ -44,12 +44,10 @@ secrets_read_policy = """{
 
 
 # =========================
-# Existing Klaviyo (unchanged)
+# Existing Klaviyo (UNCHANGED)
 # =========================
 
-
 # --- Events Resources ---
-
 events_bucket = aws.s3.Bucket("klaviyo-events-bucket")
 events_role = aws.iam.Role("eventsLambdaRole", assume_role_policy=assume_role_policy)
 
@@ -73,9 +71,7 @@ events_lambda = aws.lambda_.Function(
     ),
 )
 
-
 # --- Profiles Resources ---
-
 profiles_bucket = aws.s3.Bucket("klaviyo-profiles-bucket")
 profiles_role = aws.iam.Role("profilesLambdaRole", assume_role_policy=assume_role_policy)
 
@@ -86,7 +82,6 @@ aws.iam.RolePolicyAttachment(
 )
 aws.iam.RolePolicy("profilesSecretsAccess", role=profiles_role.id, policy=secrets_read_policy)
 
-# Keep the queue for manual ingestion if needed, but we will not link it to the Lambda
 profiles_backfill_queue = aws.sqs.Queue(
     "profilesBackfillQueue",
     name="profiles-backfill.fifo",
@@ -95,14 +90,11 @@ profiles_backfill_queue = aws.sqs.Queue(
     visibility_timeout_seconds=900,
 )
 
-# RECURSION REMOVAL: We only keep basic SQS execution logs if needed, 
-# but we DO NOT attach the EventSourceMapping or SendMessage policy.
 aws.iam.RolePolicyAttachment(
     "profilesSQSPolicy",
     role=profiles_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
 )
-
 
 aws.iam.RolePolicy(
     "profilesSQSSendPolicy",
@@ -119,7 +111,6 @@ aws.iam.RolePolicy(
     ),
 )
 
-
 profiles_lambda = aws.lambda_.Function(
     "klaviyo-profile-grab-lambda",
     role=profiles_role.arn,
@@ -132,26 +123,21 @@ profiles_lambda = aws.lambda_.Function(
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "KLAVIYO_PROFILES_BUCKET": profiles_bucket.bucket,
-            # Pass the URL but the Lambda code will no longer use it to send messages
             "KLAVIYO_PROFILES_BACKFILL_QUEUE_URL": profiles_backfill_queue.url,
         }
     ),
 )
 
-# DELETED: profilesBackfillSQSEventSource (Stops SQS from auto-triggering Lambda)
-# DELETED: profiles_cron_rule (Stops hourly automated runs)
-# DELETED: profilesCronTarget (Stops EventBridge connection)
-# DELETED: profilesCronInvokePermission (Stops external permission to invoke)
-# DELETED: profilesSQSSendPolicy (Stops Lambda from physically being able to trigger a loop)
 
 # =========================
-# Gorgias (customers stream upgraded)
+# Gorgias
 # =========================
 
 GORGIAS_BUCKET_NAME = "sources-data"
 GORGIAS_S3_PREFIX = "gorgias"
 
 gorgias_code = pulumi.AssetArchive({".": pulumi.FileArchive("./lambda/gorgias")})
+
 
 def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     """
@@ -206,6 +192,7 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         }}""",
     )
 
+    # Legacy streams self-send (recursion risk, unchanged for now)
     aws.iam.RolePolicy(
         f"gorgias-{name}-sqssend",
         role=role.id,
@@ -252,7 +239,7 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
 
 
 # -------------------------
-# State store (shared)
+# DynamoDB state store (shared)
 # -------------------------
 gorgias_state_table = aws.dynamodb.Table(
     "gorgiasBackfillState",
@@ -265,18 +252,40 @@ pulumi.export("gorgias_state_table_name", gorgias_state_table.name)
 
 
 # -------------------------
-# Customers: NEW non-recursive pattern
+# Customers: NON-RECURSIVE pipeline
+#   EventBridge Rule -> Orchestrator -> SQS -> Worker -> DDB progress -> (next tick)
+#   Orchestrator auto-disables the rule when DDB status becomes DONE/ERROR.
 # -------------------------
 
-# Standard queue (not FIFO)
+# 1) Schedule rule (define FIRST so we can reference ARN in IAM policy + name in env)
+gorgias_orchestrator_rule = aws.cloudwatch.EventRule(
+    "gorgias-orchestrator-every-minute",
+    schedule_expression="rate(1 minute)",
+)
+
+# 2) DLQ
+gorgias_customers_dlq = aws.sqs.Queue(
+    "gorgias-customers-dlq",
+    name="gorgias-customers-dlq",
+    message_retention_seconds=1209600,  # 14 days
+)
+
+# 3) Main queue (standard SQS)
 gorgias_customers_q = aws.sqs.Queue(
     "gorgias-customers-queue",
     name="gorgias-customers",
     visibility_timeout_seconds=900,
+    receive_wait_time_seconds=20,        # long polling (cheaper)
+    message_retention_seconds=1209600,   # 14 days
+    redrive_policy=gorgias_customers_dlq.arn.apply(lambda arn: f"""{{
+      "deadLetterTargetArn": "{arn}",
+      "maxReceiveCount": 5
+    }}"""),
 )
 pulumi.export("gorgias_customers_queue_url", gorgias_customers_q.url)
 
-# Customers worker role (NO sqs:SendMessage)
+
+# 4) Customers WORKER (SQS triggered, writes to S3, updates DDB, NEVER sends SQS)
 gorgias_customers_role = aws.iam.Role(
     "gorgias-customers-role",
     assume_role_policy=assume_role_policy,
@@ -337,7 +346,7 @@ gorgias_customers_fn = aws.lambda_.Function(
     handler="gorgias_customers.customers.handler",
     code=gorgias_code,
     timeout=600,
-    reserved_concurrent_executions=1,
+    reserved_concurrent_executions=1,  # stable costs + avoid API bursts
     layers=[requests_layer.arn],
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
@@ -356,11 +365,10 @@ aws.lambda_.EventSourceMapping(
     function_name=gorgias_customers_fn.arn,
     batch_size=1,
 )
-
 pulumi.export("gorgias_customers_lambda_name", gorgias_customers_fn.name)
 
 
-# Orchestrator role (can SendMessage + read/update Dynamo)
+# 5) ORCHESTRATOR (scheduled, enqueues ONE message per tick, disables its rule when DONE/ERROR)
 gorgias_orchestrator_role = aws.iam.Role(
     "gorgias-orchestrator-role",
     assume_role_policy=assume_role_policy,
@@ -380,7 +388,7 @@ aws.iam.RolePolicy(
       "Statement":[
         {{
           "Effect":"Allow",
-          "Action":["dynamodb:GetItem","dynamodb:UpdateItem"],
+          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
           "Resource":"{arn}"
         }}
       ]
@@ -402,6 +410,22 @@ aws.iam.RolePolicy(
     }}"""),
 )
 
+# ✅ allow orchestrator to disable ONLY this schedule rule
+aws.iam.RolePolicy(
+    "gorgias-orchestrator-events-disable",
+    role=gorgias_orchestrator_role.id,
+    policy=gorgias_orchestrator_rule.arn.apply(lambda rule_arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["events:DisableRule"],
+          "Resource":"{rule_arn}"
+        }}
+      ]
+    }}"""),
+)
+
 gorgias_orchestrator_fn = aws.lambda_.Function(
     "gorgias-orchestrator-lambda",
     role=gorgias_orchestrator_role.arn,
@@ -409,22 +433,37 @@ gorgias_orchestrator_fn = aws.lambda_.Function(
     handler="gorgias_orchestrator.orchestrator.handler",
     code=gorgias_code,
     timeout=60,
-    layers=[requests_layer.arn],
+    layers=[],  # orchestrator doesn't need requests
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
             "STATE_TABLE": gorgias_state_table.name,
             "BACKFILL_QUEUE_URL": gorgias_customers_q.url,
             "VISIBILITY_TIMEOUT_SEC": "900",
             "LEASE_BUFFER_SEC": "60",
+            "ORCHESTRATOR_RULE_NAME": gorgias_orchestrator_rule.name,
         }
     ),
 )
-
 pulumi.export("gorgias_orchestrator_lambda_name", gorgias_orchestrator_fn.name)
+
+aws.cloudwatch.EventTarget(
+    "gorgias-orchestrator-target",
+    rule=gorgias_orchestrator_rule.name,
+    arn=gorgias_orchestrator_fn.arn,
+    input='{"job_start_id":"gorgias_customers_backfill"}',
+)
+
+aws.lambda_.Permission(
+    "gorgias-orchestrator-invoke-permission",
+    action="lambda:InvokeFunction",
+    function=gorgias_orchestrator_fn.name,
+    principal="events.amazonaws.com",
+    source_arn=gorgias_orchestrator_rule.arn,
+)
 
 
 # -------------------------
-# Other Gorgias streams (unchanged for now)
+# Other Gorgias streams (legacy, unchanged for now)
 # -------------------------
 gorgias_tickets_q, gorgias_tickets_fn = make_gorgias_stream("tickets", "gorgias_tickets.tickets.handler")
 gorgias_surveys_q, gorgias_surveys_fn = make_gorgias_stream("satisfaction_surveys", "gorgias_satisfaction_surveys.satisfaction_surveys.handler")
@@ -432,7 +471,9 @@ gorgias_users_q, gorgias_users_fn = make_gorgias_stream("users", "gorgias_users.
 gorgias_messages_q, gorgias_messages_fn = make_gorgias_stream("messages", "gorgias_messages.messages.handler")
 
 
+# =========================
 # Exports (existing)
+# =========================
 pulumi.export("events_bucket_name", events_bucket.bucket)
 pulumi.export("events_lambda_function_name", events_lambda.name)
 pulumi.export("profiles_bucket_name", profiles_bucket.bucket)
