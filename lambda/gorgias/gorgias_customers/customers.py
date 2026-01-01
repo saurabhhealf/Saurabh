@@ -148,21 +148,24 @@ def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
 
 
 def enqueue_next(body: Dict[str, Any]) -> None:
-    
-    
-    # Generate unique deduplication ID for FIFO queue
+    # job_start_id MUST be present in body
+    job_start_id = body.get("job_start_id")
+    if not job_start_id:
+        raise RuntimeError("Missing job_start_id in enqueue body")
+
     dedup_id = f"{STREAM_NAME}-{body.get('page_start', 0)}-{uuid.uuid4()}"
-    
+
     resp = _sqs.send_message(
         QueueUrl=BACKFILL_QUEUE_URL,
         MessageBody=json.dumps(body),
-        MessageGroupId=STREAM_NAME,
+        MessageGroupId=f"{STREAM_NAME}-{job_start_id}",
         MessageDeduplicationId=dedup_id,
     )
     logger.info(
         f"[{STREAM_NAME}] ENQUEUED message_id={resp.get('MessageId')} "
         f"dedup_id={dedup_id} body={json.dumps(body)}"
     )
+
 
 
 
@@ -217,9 +220,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     records = event.get("Records", [])
 
     # ✅ requested log line
-    logger.info(f"[{STREAM_NAME}] received_records={len(event.get('Records', []))}")
+    logger.info(f"[{STREAM_NAME}] received_records={len(records)}")
 
     def process_one_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        # ✅ create or reuse job_start_id PER JOB (not globally)
+        job_start_id = job.get("job_start_id") or str(uuid.uuid4())
+
         cursor = job.get("cursor")
         page_start = int(job.get("page_start", 1))
 
@@ -270,6 +276,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             next_body = {
                 "cursor": next_cursor,
                 "page_start": page_start + pages_written,
+                "job_start_id": job_start_id,  # ✅ propagate
             }
             logger.info(f"[{STREAM_NAME}] ENQUEUE {json.dumps(next_body)}")
             enqueue_next(next_body)
@@ -291,7 +298,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         for rec in records:
             rid = rec.get("messageId")
             body = rec.get("body", "{}")
-
             logger.info(f"[{STREAM_NAME}] SQS record messageId={rid}")
 
             try:
@@ -309,4 +315,3 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         raise ValueError("Expected event to be a dict")
 
     return process_one_job(event)
-
