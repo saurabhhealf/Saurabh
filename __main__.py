@@ -145,7 +145,7 @@ profiles_lambda = aws.lambda_.Function(
 # DELETED: profilesSQSSendPolicy (Stops Lambda from physically being able to trigger a loop)
 
 # =========================
-# Gorgias (new)
+# Gorgias (customers stream upgraded)
 # =========================
 
 GORGIAS_BUCKET_NAME = "sources-data"
@@ -155,11 +155,10 @@ gorgias_code = pulumi.AssetArchive({".": pulumi.FileArchive("./lambda/gorgias")}
 
 def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     """
-    Creates:
-      - FIFO SQS queue for the stream
-      - IAM role with: logs, SQS exec, SQS send, secrets read, S3 put
-      - Lambda function pointing to handler (e.g. tickets.handler)
-      - Event source mapping SQS -> Lambda
+    Legacy pattern (still used for non-customers streams for now):
+      - FIFO SQS queue
+      - Lambda with self-send permission (recursion risk)
+      - Event source mapping
     """
     queue = aws.sqs.Queue(
         f"gorgias-{name}-queue",
@@ -174,28 +173,24 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         assume_role_policy=assume_role_policy,
     )
 
-    # Logs/basic execution
     aws.iam.RolePolicyAttachment(
         f"gorgias-{name}-basic",
         role=role.id,
         policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
     )
 
-    # Receive/Delete from SQS
     aws.iam.RolePolicyAttachment(
         f"gorgias-{name}-sqs-exec",
         role=role.id,
         policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
     )
 
-    # Read secrets (gorgias_email + gorgias_api_key)
     aws.iam.RolePolicy(
         f"gorgias-{name}-secrets",
         role=role.id,
         policy=secrets_read_policy,
     )
 
-    # Write to S3: s3://sources-data/gorgias/*
     aws.iam.RolePolicy(
         f"gorgias-{name}-s3put",
         role=role.id,
@@ -211,7 +206,6 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         }}""",
     )
 
-    # Allow SendMessage to *its own queue* (for next cursor)
     aws.iam.RolePolicy(
         f"gorgias-{name}-sqssend",
         role=role.id,
@@ -238,7 +232,6 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         layers=[requests_layer.arn],
         environment=aws.lambda_.FunctionEnvironmentArgs(
             variables={
-                # non-secret env vars only
                 "BACKFILL_QUEUE_URL": queue.url,
                 "STREAM_NAME": name,
             }
@@ -258,9 +251,183 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     return queue, fn
 
 
+# -------------------------
+# State store (shared)
+# -------------------------
+gorgias_state_table = aws.dynamodb.Table(
+    "gorgiasBackfillState",
+    name="gorgias_backfill_state",
+    attributes=[aws.dynamodb.TableAttributeArgs(name="job_start_id", type="S")],
+    hash_key="job_start_id",
+    billing_mode="PAY_PER_REQUEST",
+)
+pulumi.export("gorgias_state_table_name", gorgias_state_table.name)
+
+
+# -------------------------
+# Customers: NEW non-recursive pattern
+# -------------------------
+
+# Standard queue (not FIFO)
+gorgias_customers_q = aws.sqs.Queue(
+    "gorgias-customers-queue",
+    name="gorgias-customers",
+    visibility_timeout_seconds=900,
+)
+pulumi.export("gorgias_customers_queue_url", gorgias_customers_q.url)
+
+# Customers worker role (NO sqs:SendMessage)
+gorgias_customers_role = aws.iam.Role(
+    "gorgias-customers-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-customers-basic",
+    role=gorgias_customers_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-customers-sqs-exec",
+    role=gorgias_customers_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+)
+
+aws.iam.RolePolicy(
+    "gorgias-customers-secrets",
+    role=gorgias_customers_role.id,
+    policy=secrets_read_policy,
+)
+
+aws.iam.RolePolicy(
+    "gorgias-customers-s3put",
+    role=gorgias_customers_role.id,
+    policy=f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["s3:PutObject"],
+          "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+        }}
+      ]
+    }}""",
+)
+
+aws.iam.RolePolicy(
+    "gorgias-customers-ddb",
+    role=gorgias_customers_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+          "Resource":"{arn}"
+        }}
+      ]
+    }}"""),
+)
+
+gorgias_customers_fn = aws.lambda_.Function(
+    "gorgias-customers-lambda",
+    role=gorgias_customers_role.arn,
+    runtime="python3.13",
+    handler="gorgias_customers.customers.handler",
+    code=gorgias_code,
+    timeout=600,
+    reserved_concurrent_executions=1,
+    layers=[requests_layer.arn],
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "STATE_TABLE": gorgias_state_table.name,
+            "S3_BUCKET": GORGIAS_BUCKET_NAME,
+            "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
+            "PAGE_SIZE": "100",
+            "PAGES_PER_INVOCATION": "10",
+        }
+    ),
+)
+
+aws.lambda_.EventSourceMapping(
+    "gorgias-customers-esm",
+    event_source_arn=gorgias_customers_q.arn,
+    function_name=gorgias_customers_fn.arn,
+    batch_size=1,
+)
+
+pulumi.export("gorgias_customers_lambda_name", gorgias_customers_fn.name)
+
+
+# Orchestrator role (can SendMessage + read/update Dynamo)
+gorgias_orchestrator_role = aws.iam.Role(
+    "gorgias-orchestrator-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-orchestrator-basic",
+    role=gorgias_orchestrator_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+
+aws.iam.RolePolicy(
+    "gorgias-orchestrator-ddb",
+    role=gorgias_orchestrator_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["dynamodb:GetItem","dynamodb:UpdateItem"],
+          "Resource":"{arn}"
+        }}
+      ]
+    }}"""),
+)
+
+aws.iam.RolePolicy(
+    "gorgias-orchestrator-sqs-send",
+    role=gorgias_orchestrator_role.id,
+    policy=gorgias_customers_q.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["sqs:SendMessage"],
+          "Resource":"{arn}"
+        }}
+      ]
+    }}"""),
+)
+
+gorgias_orchestrator_fn = aws.lambda_.Function(
+    "gorgias-orchestrator-lambda",
+    role=gorgias_orchestrator_role.arn,
+    runtime="python3.13",
+    handler="gorgias_orchestrator.orchestrator.handler",
+    code=gorgias_code,
+    timeout=60,
+    layers=[requests_layer.arn],
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "STATE_TABLE": gorgias_state_table.name,
+            "BACKFILL_QUEUE_URL": gorgias_customers_q.url,
+            "VISIBILITY_TIMEOUT_SEC": "900",
+            "LEASE_BUFFER_SEC": "60",
+        }
+    ),
+)
+
+pulumi.export("gorgias_orchestrator_lambda_name", gorgias_orchestrator_fn.name)
+
+
+# -------------------------
+# Other Gorgias streams (unchanged for now)
+# -------------------------
 gorgias_tickets_q, gorgias_tickets_fn = make_gorgias_stream("tickets", "gorgias_tickets.tickets.handler")
 gorgias_surveys_q, gorgias_surveys_fn = make_gorgias_stream("satisfaction_surveys", "gorgias_satisfaction_surveys.satisfaction_surveys.handler")
-gorgias_customers_q, gorgias_customers_fn = make_gorgias_stream("customers", "gorgias_customers.customers.handler")
 gorgias_users_q, gorgias_users_fn = make_gorgias_stream("users", "gorgias_users.users.handler")
 gorgias_messages_q, gorgias_messages_fn = make_gorgias_stream("messages", "gorgias_messages.messages.handler")
 
