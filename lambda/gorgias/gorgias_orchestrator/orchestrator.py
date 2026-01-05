@@ -132,3 +132,4 @@ def handler(event, context):
             ExpressionAttributeValues={":false": False, ":zero": 0, ":now": now, ":e": str(e)[:2000]},
         )
         raise
+

@@ -238,6 +238,225 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     return queue, fn
 
 
+
+
+def make_gorgias_orchestrated_stream(
+    name: str,
+    handler: str,
+    job_start_id: str,
+    schedule_expression: str = "rate(1 minute)",
+    max_concurrency: int = 1,
+):
+    """
+    Orchestrated pattern (same as customers):
+      - Standard SQS queue + DLQ
+      - Worker Lambda reads SQS, writes S3, updates DDB (NO self-send)
+      - Orchestrator Lambda runs on EventBridge, enqueues ONE message per tick
+      - Orchestrator disables its rule once job is DONE/ERROR (handled inside gorgias_orchestrator)
+    """
+    # Queues
+    dlq = aws.sqs.Queue(
+        f"gorgias-{name}-33d-dlq",
+        name=f"gorgias-{name}-33d-dlq",
+    )
+
+    q = aws.sqs.Queue(
+        f"gorgias-{name}-33d-queue",
+        name=f"gorgias-{name}-33d-queue",
+        visibility_timeout_seconds=900,
+        redrive_policy=dlq.arn.apply(lambda arn: f"""{{
+          "deadLetterTargetArn": "{arn}",
+          "maxReceiveCount": 5
+        }}"""),
+    )
+
+    pulumi.export(f"gorgias_{name}_33d_queue_url", q.url)
+
+    # Worker role/policies
+    role = aws.iam.Role(
+        f"gorgias-{name}-33d-role",
+        assume_role_policy=assume_role_policy,
+    )
+
+    aws.iam.RolePolicyAttachment(
+        f"gorgias-{name}-33d-basic",
+        role=role.id,
+        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+    )
+
+    aws.iam.RolePolicyAttachment(
+        f"gorgias-{name}-33d-sqs-exec",
+        role=role.id,
+        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+    )
+
+    aws.iam.RolePolicy(
+        f"gorgias-{name}-33d-secrets",
+        role=role.id,
+        policy=secrets_read_policy,
+    )
+
+    aws.iam.RolePolicy(
+        f"gorgias-{name}-33d-s3-put",
+        role=role.id,
+        policy=f"""{{
+          "Version":"2012-10-17",
+          "Statement":[
+            {{
+              "Effect":"Allow",
+              "Action":["s3:PutObject"],
+              "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+            }}
+          ]
+        }}""",
+    )
+
+    aws.iam.RolePolicy(
+        f"gorgias-{name}-33d-ddb",
+        role=role.id,
+        policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+          "Version":"2012-10-17",
+          "Statement":[
+            {{
+              "Effect":"Allow",
+              "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+              "Resource":"{arn}"
+            }}
+          ]
+        }}"""),
+    )
+
+    # Worker lambda
+    fn = aws.lambda_.Function(
+        f"gorgias-{name}-33d-lambda",
+        role=role.arn,
+        runtime="python3.13",
+        handler=handler,
+        code=gorgias_code,
+        timeout=600,
+        reserved_concurrent_executions=max_concurrency,
+        layers=[requests_layer.arn],
+        environment=aws.lambda_.FunctionEnvironmentArgs(
+            variables={
+                "STATE_TABLE": gorgias_state_table.name,
+                "S3_BUCKET": GORGIAS_BUCKET_NAME,
+                "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
+                "PAGE_SIZE": "100",
+                "PAGES_PER_INVOCATION": "5",
+                "CUTOFF_DAYS": "33",
+                "FILTER_TO_CUTOFF": "true",
+            }
+        ),
+    )
+
+    aws.lambda_.EventSourceMapping(
+        f"gorgias-{name}-33d-esm",
+        event_source_arn=q.arn,
+        function_name=fn.arn,
+        batch_size=1,
+    )
+
+    pulumi.export(f"gorgias_{name}_33d_lambda_name", fn.name)
+
+    # Orchestrator (per stream)
+    rule = aws.cloudwatch.EventRule(
+        f"gorgias-{name}-33d-orchestrator-rule",
+        schedule_expression=schedule_expression,
+    )
+
+    orch_role = aws.iam.Role(
+        f"gorgias-{name}-33d-orchestrator-role",
+        assume_role_policy=assume_role_policy,
+    )
+
+    aws.iam.RolePolicyAttachment(
+        f"gorgias-{name}-33d-orchestrator-basic",
+        role=orch_role.id,
+        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+    )
+
+    aws.iam.RolePolicy(
+        f"gorgias-{name}-33d-orchestrator-ddb",
+        role=orch_role.id,
+        policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+          "Version":"2012-10-17",
+          "Statement":[
+            {{
+              "Effect":"Allow",
+              "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+              "Resource":"{arn}"
+            }}
+          ]
+        }}"""),
+    )
+
+    aws.iam.RolePolicy(
+        f"gorgias-{name}-33d-orchestrator-sqs-send",
+        role=orch_role.id,
+        policy=q.arn.apply(lambda arn: f"""{{
+          "Version":"2012-10-17",
+          "Statement":[
+            {{
+              "Effect":"Allow",
+              "Action":["sqs:SendMessage"],
+              "Resource":"{arn}"
+            }}
+          ]
+        }}"""),
+    )
+
+    aws.iam.RolePolicy(
+        f"gorgias-{name}-33d-orchestrator-events-disable",
+        role=orch_role.id,
+        policy=rule.arn.apply(lambda rule_arn: f"""{{
+          "Version":"2012-10-17",
+          "Statement":[
+            {{
+              "Effect":"Allow",
+              "Action":["events:DisableRule"],
+              "Resource":"{rule_arn}"
+            }}
+          ]
+        }}"""),
+    )
+
+    orch_fn = aws.lambda_.Function(
+        f"gorgias-{name}-33d-orchestrator-lambda",
+        role=orch_role.arn,
+        runtime="python3.13",
+        handler="gorgias_orchestrator.orchestrator.handler",
+        code=gorgias_code,
+        timeout=60,
+        layers=[requests_layer.arn],
+        environment=aws.lambda_.FunctionEnvironmentArgs(
+            variables={
+                "STATE_TABLE": gorgias_state_table.name,
+                "BACKFILL_QUEUE_URL": q.url,
+                "ORCHESTRATOR_RULE_NAME": rule.name,
+            }
+        ),
+    )
+
+    aws.cloudwatch.EventTarget(
+        f"gorgias-{name}-33d-orchestrator-target",
+        rule=rule.name,
+        arn=orch_fn.arn,
+        input=json.dumps({"job_start_id": job_start_id}),
+    )
+
+    aws.lambda_.Permission(
+        f"gorgias-{name}-33d-orchestrator-invoke",
+        action="lambda:InvokeFunction",
+        function=orch_fn.name,
+        principal="events.amazonaws.com",
+        source_arn=rule.arn,
+    )
+
+    pulumi.export(f"gorgias_{name}_33d_orchestrator_rule_name", rule.name)
+    pulumi.export(f"gorgias_{name}_33d_orchestrator_lambda_name", orch_fn.name)
+
+    return q, fn
+
 # -------------------------
 # DynamoDB state store (shared)
 # -------------------------
@@ -463,12 +682,31 @@ aws.lambda_.Permission(
 
 
 # -------------------------
-# Other Gorgias streams (legacy, unchanged for now)
+# Other Gorgias streams (orchestrated, last 33 days)
 # -------------------------
-gorgias_tickets_q, gorgias_tickets_fn = make_gorgias_stream("tickets", "gorgias_tickets.tickets.handler")
-gorgias_surveys_q, gorgias_surveys_fn = make_gorgias_stream("satisfaction_surveys", "gorgias_satisfaction_surveys.satisfaction_surveys.handler")
-gorgias_users_q, gorgias_users_fn = make_gorgias_stream("users", "gorgias_users.users.handler")
-gorgias_messages_q, gorgias_messages_fn = make_gorgias_stream("messages", "gorgias_messages.messages.handler")
+gorgias_tickets_q, gorgias_tickets_fn = make_gorgias_orchestrated_stream(
+    "tickets",
+    "gorgias_tickets.tickets.handler",
+    job_start_id="gorgias_tickets_last_33d",
+)
+
+gorgias_surveys_q, gorgias_surveys_fn = make_gorgias_orchestrated_stream(
+    "satisfaction-surveys",
+    "gorgias_satisfaction_surveys.satisfaction_surveys.handler",
+    job_start_id="gorgias_satisfaction_surveys_last_33d",
+)
+
+gorgias_users_q, gorgias_users_fn = make_gorgias_orchestrated_stream(
+    "users",
+    "gorgias_users.users.handler",
+    job_start_id="gorgias_users_last_33d",
+)
+
+gorgias_messages_q, gorgias_messages_fn = make_gorgias_orchestrated_stream(
+    "messages",
+    "gorgias_messages.messages.handler",
+    job_start_id="gorgias_messages_last_33d",
+)
 
 
 # =========================
@@ -479,3 +717,6 @@ pulumi.export("events_lambda_function_name", events_lambda.name)
 pulumi.export("profiles_bucket_name", profiles_bucket.bucket)
 pulumi.export("profiles_lambda_function_name", profiles_lambda.name)
 pulumi.export("profiles_backfill_queue_url", profiles_backfill_queue.url)
+
+
+--------------------------------
