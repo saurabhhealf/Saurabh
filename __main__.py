@@ -138,7 +138,7 @@ GORGIAS_S3_PREFIX = "gorgias"
 gorgias_code = pulumi.AssetArchive({".": pulumi.FileArchive("./lambda/gorgias")})
 
 # -------------------------
-# DynamoDB state store (shared)  ✅ define BEFORE any helper uses it
+# DynamoDB state store (shared) ✅ define BEFORE any helper uses it
 # -------------------------
 gorgias_state_table = aws.dynamodb.Table(
     "gorgiasBackfillState",
@@ -149,6 +149,93 @@ gorgias_state_table = aws.dynamodb.Table(
 )
 pulumi.export("gorgias_state_table_name", gorgias_state_table.name)
 
+# -------------------------
+# ✅ Shared roles for non-customer orchestrated streams (tickets/users/messages/surveys)
+#    - Do NOT touch customers roles below
+# -------------------------
+
+gorgias_streams_worker_role = aws.iam.Role(
+    "gorgias-streams-worker-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-streams-worker-basic",
+    role=gorgias_streams_worker_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-streams-worker-sqs-exec",
+    role=gorgias_streams_worker_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+)
+
+aws.iam.RolePolicy(
+    "gorgias-streams-worker-secrets",
+    role=gorgias_streams_worker_role.id,
+    policy=secrets_read_policy,
+)
+
+aws.iam.RolePolicy(
+    "gorgias-streams-worker-s3put",
+    role=gorgias_streams_worker_role.id,
+    policy=f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["s3:PutObject"],
+          "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+        }}
+      ]
+    }}""",
+)
+
+aws.iam.RolePolicy(
+    "gorgias-streams-worker-ddb",
+    role=gorgias_streams_worker_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+          "Resource":"{arn}"
+        }}
+      ]
+    }}"""),
+)
+
+gorgias_streams_orchestrator_role = aws.iam.Role(
+    "gorgias-streams-orchestrator-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-streams-orchestrator-basic",
+    role=gorgias_streams_orchestrator_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+
+aws.iam.RolePolicy(
+    "gorgias-streams-orchestrator-ddb",
+    role=gorgias_streams_orchestrator_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[
+        {{
+          "Effect":"Allow",
+          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+          "Resource":"{arn}"
+        }}
+      ]
+    }}"""),
+)
+
+# -------------------------
+# Legacy FIFO streams (kept so Pulumi won't delete existing FIFO resources)
+# -------------------------
 def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     """
     Legacy pattern (kept so Pulumi won't delete existing FIFO resources):
@@ -246,6 +333,11 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     return queue, fn
 
 
+# -------------------------
+# Orchestrated streams (tickets/users/messages/surveys) — now using shared roles
+# NOTE: resource names keep "-33d-" to avoid breaking existing infra names.
+#       You can later rename if you accept resource replacement.
+# -------------------------
 def make_gorgias_orchestrated_stream(
     name: str,
     handler: str,
@@ -256,9 +348,13 @@ def make_gorgias_orchestrated_stream(
     """
     Orchestrated pattern (same as customers):
       - Standard SQS queue + DLQ
-      - Worker Lambda reads SQS, writes S3, updates DDB (NO self-send)
+      - Worker Lambda reads SQS, writes S3, updates DDB
       - Orchestrator Lambda runs on EventBridge, enqueues ONE message per tick
       - Orchestrator disables its rule once job is DONE/ERROR
+
+    Uses:
+      - shared worker role: gorgias_streams_worker_role
+      - shared orchestrator role: gorgias_streams_orchestrator_role
     """
     dlq = aws.sqs.Queue(
         f"gorgias-{name}-33d-dlq",
@@ -277,62 +373,10 @@ def make_gorgias_orchestrated_stream(
 
     pulumi.export(f"gorgias_{name}_33d_queue_url", q.url)
 
-    role = aws.iam.Role(
-        f"gorgias-{name}-33d-role",
-        assume_role_policy=assume_role_policy,
-    )
-
-    aws.iam.RolePolicyAttachment(
-        f"gorgias-{name}-33d-basic",
-        role=role.id,
-        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-    )
-
-    aws.iam.RolePolicyAttachment(
-        f"gorgias-{name}-33d-sqs-exec",
-        role=role.id,
-        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
-    )
-
-    aws.iam.RolePolicy(
-        f"gorgias-{name}-33d-secrets",
-        role=role.id,
-        policy=secrets_read_policy,
-    )
-
-    aws.iam.RolePolicy(
-        f"gorgias-{name}-33d-s3-put",
-        role=role.id,
-        policy=f"""{{
-          "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["s3:PutObject"],
-              "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
-            }}
-          ]
-        }}""",
-    )
-
-    aws.iam.RolePolicy(
-        f"gorgias-{name}-33d-ddb",
-        role=role.id,
-        policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
-          "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
-              "Resource":"{arn}"
-            }}
-          ]
-        }}"""),
-    )
-
+    # Worker lambda (shared worker role)
     fn = aws.lambda_.Function(
         f"gorgias-{name}-33d-lambda",
-        role=role.arn,
+        role=gorgias_streams_worker_role.arn,
         runtime="python3.13",
         handler=handler,
         code=gorgias_code,
@@ -346,8 +390,10 @@ def make_gorgias_orchestrated_stream(
                 "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
                 "PAGE_SIZE": "100",
                 "PAGES_PER_INVOCATION": "5",
-                "CUTOFF_DAYS": "33",
-                "FILTER_TO_CUTOFF": "true",
+                # IMPORTANT:
+                # We are NOT forcing a 33d cutoff here anymore. If your lambda code still reads
+                # CUTOFF_DAYS/FILTER_TO_CUTOFF, set FILTER_TO_CUTOFF=false there or ignore them.
+                "FILTER_TO_CUTOFF": "false",
             }
         ),
     )
@@ -361,40 +407,17 @@ def make_gorgias_orchestrated_stream(
 
     pulumi.export(f"gorgias_{name}_33d_lambda_name", fn.name)
 
+    # EventBridge rule
     rule = aws.cloudwatch.EventRule(
         f"gorgias-{name}-33d-orchestrator-rule",
         schedule_expression=schedule_expression,
     )
 
-    orch_role = aws.iam.Role(
-        f"gorgias-{name}-33d-orchestrator-role",
-        assume_role_policy=assume_role_policy,
-    )
-
-    aws.iam.RolePolicyAttachment(
-        f"gorgias-{name}-33d-orchestrator-basic",
-        role=orch_role.id,
-        policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-    )
-
+    # Attach per-stream permissions to the SHARED orchestrator role:
+    # 1) allow SendMessage to THIS stream queue
     aws.iam.RolePolicy(
-        f"gorgias-{name}-33d-orchestrator-ddb",
-        role=orch_role.id,
-        policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
-          "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
-              "Resource":"{arn}"
-            }}
-          ]
-        }}"""),
-    )
-
-    aws.iam.RolePolicy(
-        f"gorgias-{name}-33d-orchestrator-sqs-send",
-        role=orch_role.id,
+        f"gorgias-streams-orch-{name}-sqs-send",
+        role=gorgias_streams_orchestrator_role.id,
         policy=q.arn.apply(lambda arn: f"""{{
           "Version":"2012-10-17",
           "Statement":[
@@ -407,9 +430,10 @@ def make_gorgias_orchestrated_stream(
         }}"""),
     )
 
+    # 2) allow DisableRule for THIS stream rule
     aws.iam.RolePolicy(
-        f"gorgias-{name}-33d-orchestrator-events-disable",
-        role=orch_role.id,
+        f"gorgias-streams-orch-{name}-events-disable",
+        role=gorgias_streams_orchestrator_role.id,
         policy=rule.arn.apply(lambda rule_arn: f"""{{
           "Version":"2012-10-17",
           "Statement":[
@@ -422,9 +446,10 @@ def make_gorgias_orchestrated_stream(
         }}"""),
     )
 
+    # Orchestrator lambda (shared orchestrator role)
     orch_fn = aws.lambda_.Function(
         f"gorgias-{name}-33d-orchestrator-lambda",
-        role=orch_role.arn,
+        role=gorgias_streams_orchestrator_role.arn,
         runtime="python3.13",
         handler="gorgias_orchestrator.orchestrator.handler",
         code=gorgias_code,
@@ -435,7 +460,6 @@ def make_gorgias_orchestrated_stream(
                 "STATE_TABLE": gorgias_state_table.name,
                 "BACKFILL_QUEUE_URL": q.url,
                 "ORCHESTRATOR_RULE_NAME": rule.name,
-                # Keep these so the orchestrator lease matches queue VT
                 "VISIBILITY_TIMEOUT_SEC": "900",
                 "LEASE_BUFFER_SEC": "60",
             }
@@ -487,7 +511,7 @@ gorgias_messages_fifo_q, gorgias_messages_fifo_fn = make_gorgias_stream(
 )
 
 # -------------------------
-# Customers: NON-RECURSIVE pipeline
+# Customers: NON-RECURSIVE pipeline (UNCHANGED)
 # -------------------------
 gorgias_orchestrator_rule = aws.cloudwatch.EventRule(
     "gorgias-orchestrator-every-minute",
@@ -686,7 +710,7 @@ aws.lambda_.Permission(
 )
 
 # -------------------------
-# Other Gorgias streams (orchestrated, last 33 days)
+# Other Gorgias streams (orchestrated) — shared roles now
 # -------------------------
 gorgias_tickets_33d_q, gorgias_tickets_33d_fn = make_gorgias_orchestrated_stream(
     "tickets",

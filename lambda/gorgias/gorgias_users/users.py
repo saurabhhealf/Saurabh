@@ -1,4 +1,3 @@
-
 import json
 import os
 import time
@@ -27,17 +26,20 @@ S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias")
 STATE_TABLE = os.environ["STATE_TABLE"]
 TABLE = _ddb.Table(STATE_TABLE)
 
-STREAM_NAME = 'users'
-ENDPOINT = '/users'
+STREAM_NAME = "users"
+ENDPOINT = "/users"
 
-# Ordering / cutoff
+# Ordering / default direction
 USE_ORDER_BY = os.environ.get("USE_ORDER_BY", "true").lower() in ("1", "true", "yes", "y")
-ORDER_BY_FIELD = 'updated_datetime'  # only used if USE_ORDER_BY is true
-DIRECTION_DEFAULT = "desc"           # managers want "latest -> go back"
+ORDER_BY_FIELD = "updated_datetime"
+DIRECTION_DEFAULT = "desc"
+
+# Windowing
 CUTOFF_DAYS = int(os.environ.get("CUTOFF_DAYS", "33"))
-CUTOFF_FIELD = 'updated_datetime'      # datetime field inside items used for cutoff/filter
+CUTOFF_FIELD = "updated_datetime"
 FILTER_TO_CUTOFF = os.environ.get("FILTER_TO_CUTOFF", "true").lower() in ("1", "true", "yes", "y")
 
+# Paging / throttling
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 REQUEST_TIMEOUT = (10, 60)
 
@@ -97,6 +99,7 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
     if not s:
         return None
     try:
+        s = str(s).strip()
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
@@ -107,9 +110,66 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
         return None
 
 
+def _parse_dateish_to_utc_bound(value: Optional[str], is_end: bool) -> Optional[datetime]:
+    """
+    Accepts:
+      - YYYY-MM-DD
+      - DD-MM-YYYY
+      - full ISO datetime (with/without tz)
+    Returns UTC datetime bound:
+      - start => 00:00:00Z
+      - end   => 23:59:59.999999Z
+    """
+    if not value:
+        return None
+    v = str(value).strip().strip('"').strip("'")
+    if not v:
+        return None
+
+    # ISO datetime
+    dt = parse_iso_utc(v)
+    if dt:
+        return dt
+
+    fmts = ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y")
+    for fmt in fmts:
+        try:
+            d = datetime.strptime(v, fmt).date()
+            if is_end:
+                return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+            return datetime(d.year, d.month, d.day, 0, 0, 0, 0, tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    raise ValueError(f"Unrecognized date format: {value!r}")
+
+
 def compute_cutoff_dt(now_utc: Optional[datetime] = None) -> datetime:
     now_utc = now_utc or datetime.now(timezone.utc)
     return now_utc - timedelta(days=CUTOFF_DAYS)
+
+
+def resolve_window(job: Dict[str, Any]) -> Tuple[datetime, datetime, str]:
+    """
+    Returns (start_dt_utc, end_dt_utc, mode) where mode is:
+      - "range" if explicit dates provided
+      - "cutoff_days" if fallback to last N days
+    """
+    start_raw = job.get("start_date") or os.environ.get("START_DATE")
+    end_raw = job.get("end_date") or os.environ.get("END_DATE")
+
+    start_dt = _parse_dateish_to_utc_bound(start_raw, is_end=False)
+    end_dt = _parse_dateish_to_utc_bound(end_raw, is_end=True)
+
+    if start_dt and end_dt:
+        if end_dt < start_dt:
+            raise ValueError(f"end_date < start_date: start={start_dt.isoformat()} end={end_dt.isoformat()}")
+        return start_dt, end_dt, "range"
+
+    # fallback: last N days up to now
+    cutoff_dt = compute_cutoff_dt()
+    now_dt = datetime.now(timezone.utc)
+    return cutoff_dt, now_dt, "cutoff_days"
 
 
 def make_session() -> requests.Session:
@@ -120,8 +180,6 @@ def make_session() -> requests.Session:
 
 
 def _maybe_adaptive_sleep(headers: Dict[str, str]) -> None:
-    # If the API gives us X-Gorgias-Account-Api-Call-Limit like "10/40",
-    # gently back off when we're close to the ceiling to reduce 429s.
     limit_hdr = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
     if not limit_hdr:
         return
@@ -148,8 +206,7 @@ def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Tu
             time.sleep(retry_after + 1)
             continue
 
-        # Optional: if order_by is not supported for this endpoint (or this account),
-        # fall back once without it.
+        # If order_by isn't supported for this endpoint, retry once without it.
         if r.status_code == 400 and USE_ORDER_BY and "order_by" in params:
             logger.warning(f"[{STREAM_NAME}] 400 with order_by, retrying once without order_by. url={r.url}")
             params = dict(params)
@@ -167,12 +224,7 @@ def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Tu
 
 def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
     raw = json.dumps(payload).encode("utf-8")
-    _s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=raw,
-        ContentType="application/json",
-    )
+    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=raw, ContentType="application/json")
 
 
 def time_budget_ok(context: Any, buffer_ms: int = 70_000) -> bool:
@@ -186,16 +238,8 @@ def _release_lease(job_start_id: str) -> None:
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
         UpdateExpression="SET #in_flight = :false, #lease_until = :zero, #updated_at = :now",
-        ExpressionAttributeNames={
-            "#in_flight": "in_flight",
-            "#lease_until": "lease_until",
-            "#updated_at": "updated_at",
-        },
-        ExpressionAttributeValues={
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        },
+        ExpressionAttributeNames={"#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at"},
+        ExpressionAttributeValues={":false": False, ":zero": 0, ":now": now},
     )
 
 
@@ -233,7 +277,10 @@ def _ddb_mark_done(job_start_id: str, expected_cursor: Optional[str], expected_p
                 "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
                 f"({cursor_condition})"
             ),
-            UpdateExpression="SET #status = :done, #in_flight = :false, #lease_until = :zero, #updated_at = :now REMOVE #cursor",
+            UpdateExpression=(
+                "SET #status = :done, #in_flight = :false, #lease_until = :zero, #updated_at = :now "
+                "REMOVE #cursor"
+            ),
             ExpressionAttributeNames={
                 "#status": "status",
                 "#page": "page",
@@ -311,7 +358,9 @@ def _ddb_update_progress(
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(f"[{STREAM_NAME}] DDB conditional failed (PROGRESS). Likely duplicate/out-of-order. job={job_start_id}")
+            logger.warning(
+                f"[{STREAM_NAME}] DDB conditional failed (PROGRESS). Likely duplicate/out-of-order. job={job_start_id}"
+            )
             _release_lease(job_start_id)
             return
         raise
@@ -328,12 +377,7 @@ def _ddb_record_error(job_start_id: str, err: str) -> None:
             "#lease_until": "lease_until",
             "#updated_at": "updated_at",
         },
-        ExpressionAttributeValues={
-            ":e": err[:2000],
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        },
+        ExpressionAttributeValues={":e": err[:2000], ":false": False, ":zero": 0, ":now": now},
     )
 
 
@@ -342,28 +386,38 @@ def _parse_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(body) if isinstance(body, str) else body
 
 
-def _apply_cutoff(
+def _apply_window(
     items: List[Dict[str, Any]],
-    cutoff_dt: datetime,
-) -> Tuple[List[Dict[str, Any]], bool, Optional[datetime], Optional[datetime]]:
-    # Returns (filtered_items, reached_cutoff, min_dt, max_dt).
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Tuple[List[Dict[str, Any]], bool, Optional[datetime], Optional[datetime], int, int, int]:
+    """
+    Returns:
+      (filtered_items, reached_start, min_dt, max_dt, original_count, kept_count, skipped_newer_than_end_count)
+
+    reached_start means: we paged far enough back that at least one item is older than start_dt.
+    We still filter to [start_dt, end_dt] inclusive.
+    """
     dts: List[datetime] = []
+    newer_than_end = 0
+
     for it in items:
         dt = parse_iso_utc(it.get(CUTOFF_FIELD))
         if dt:
             dts.append(dt)
+            if dt > end_dt:
+                newer_than_end += 1
 
     if not dts:
-        # If the field isn't present, we can't safely cutoff; keep all.
-        return items, False, None, None
+        return items, False, None, None, len(items), len(items), 0
 
     min_dt = min(dts)
     max_dt = max(dts)
 
-    reached_cutoff = min_dt < cutoff_dt
+    reached_start = min_dt < start_dt
 
     if not FILTER_TO_CUTOFF:
-        return items, reached_cutoff, min_dt, max_dt
+        return items, reached_start, min_dt, max_dt, len(items), len(items), newer_than_end
 
     filtered: List[Dict[str, Any]] = []
     for it in items:
@@ -371,10 +425,10 @@ def _apply_cutoff(
         if not dt:
             filtered.append(it)
             continue
-        if dt >= cutoff_dt:
+        if start_dt <= dt <= end_dt:
             filtered.append(it)
 
-    return filtered, reached_cutoff, min_dt, max_dt
+    return filtered, reached_start, min_dt, max_dt, len(items), len(filtered), newer_than_end
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -382,7 +436,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"[{STREAM_NAME}] received_records={len(records)}")
 
     results: List[Dict[str, Any]] = []
-    cutoff_dt = compute_cutoff_dt()
 
     for rec in records:
         job = _parse_record(rec)
@@ -392,11 +445,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         msg_cursor: Optional[str] = job.get("cursor")
         msg_page: int = int(job.get("page", 1))
 
-        # Local loop vars (mutable)
         cursor = msg_cursor
         page = msg_page
 
         direction = (job.get("direction") or DIRECTION_DEFAULT).lower()
+
+        start_dt, end_dt, window_mode = resolve_window(job)
+        logger.info(
+            f"[{STREAM_NAME}] job={job_start_id} window_mode={window_mode} "
+            f"start_utc={start_dt.isoformat()} end_utc={end_dt.isoformat()}"
+        )
 
         session = make_session()
         pages_written = 0
@@ -418,46 +476,49 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
                     break
 
-                # Cutoff handling (33 days)
-                filtered_items, reached_cutoff, min_dt, max_dt = _apply_cutoff(items, cutoff_dt)
+                filtered_items, reached_start, min_dt, max_dt, original_count, kept_count, skipped_newer = _apply_window(
+                    items, start_dt, end_dt
+                )
 
                 if FILTER_TO_CUTOFF:
                     payload = dict(payload)
                     payload["data"] = filtered_items
-                    payload["_healf_cutoff"] = {
-                        "cutoff_days": CUTOFF_DAYS,
-                        "cutoff_utc": cutoff_dt.isoformat(),
+                    payload["_healf_window"] = {
+                        "mode": window_mode,
+                        "start_utc": start_dt.isoformat(),
+                        "end_utc": end_dt.isoformat(),
                         "field": CUTOFF_FIELD,
                         "direction": direction,
-                        "reached_cutoff": reached_cutoff,
+                        "reached_start": reached_start,
                         "min_dt": min_dt.isoformat() if min_dt else None,
                         "max_dt": max_dt.isoformat() if max_dt else None,
-                        "original_count": len(items),
-                        "kept_count": len(filtered_items),
+                        "original_count": original_count,
+                        "kept_count": kept_count,
+                        "skipped_newer_than_end_count": skipped_newer,
                     }
 
-                # If everything is older than cutoff, we're done and shouldn't write.
-                if FILTER_TO_CUTOFF and len(filtered_items) == 0 and reached_cutoff:
-                    logger.info(f"[{STREAM_NAME}] cutoff passed and no items kept -> DONE job={job_start_id} page={page}")
+                # If we've already crossed start bound and kept nothing -> done (don't write)
+                if FILTER_TO_CUTOFF and kept_count == 0 and reached_start:
+                    logger.info(
+                        f"[{STREAM_NAME}] passed start bound and nothing kept -> DONE job={job_start_id} page={page}"
+                    )
                     _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
                     break
 
-                # Write to S3 (same layout as customers)
                 s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/job={job_start_id}/page={page:06d}.json"
                 s3_put_json(s3_key, payload)
 
                 limit_hdr = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
                 logger.info(
-                    f"[{STREAM_NAME}] WROTE job={job_start_id} page={page} items={len(payload.get('data') or [])} "
-                    f"next_cursor_present={bool(api_next_cursor)} cutoff_reached={reached_cutoff} "
+                    f"[{STREAM_NAME}] WROTE job={job_start_id} page={page} kept={kept_count}/{original_count} "
+                    f"next_cursor_present={bool(api_next_cursor)} reached_start={reached_start} "
                     f"rate_limit={limit_hdr!r} s3_key={s3_key}"
                 )
 
                 pages_written += 1
 
-                # Stop at cutoff boundary (we already wrote the last in-range page)
-                if reached_cutoff:
-                    logger.info(f"[{STREAM_NAME}] reached cutoff -> DONE job={job_start_id} last_page={page}")
+                if reached_start:
+                    logger.info(f"[{STREAM_NAME}] reached start bound -> DONE job={job_start_id} last_page={page}")
                     _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
                     break
 
@@ -466,7 +527,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
                     break
 
-                # Update DDB using the expected msg_* values
                 _ddb_update_progress(
                     job_start_id=job_start_id,
                     expected_cursor=msg_cursor,
@@ -475,11 +535,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     next_page=page + 1,
                 )
 
-                # After successful state update, expected state becomes the new state
                 msg_cursor = api_next_cursor
                 msg_page = page + 1
-
-                # Advance local vars
                 cursor = api_next_cursor
                 page = page + 1
 
@@ -491,8 +548,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             _ddb_record_error(job_start_id, str(e))
             raise
         finally:
-            # Safety: if we never wrote a page (so no progress/done update released the lease),
-            # release it so orchestrator can retry quickly.
             if pages_written == 0:
                 _release_lease(job_start_id)
 
