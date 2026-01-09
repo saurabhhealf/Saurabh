@@ -138,7 +138,7 @@ GORGIAS_S3_PREFIX = "gorgias"
 gorgias_code = pulumi.AssetArchive({".": pulumi.FileArchive("./lambda/gorgias")})
 
 # -------------------------
-# DynamoDB state store (shared) ✅ define BEFORE any helper uses it
+# DynamoDB state store (shared)
 # -------------------------
 gorgias_state_table = aws.dynamodb.Table(
     "gorgiasBackfillState",
@@ -150,10 +150,8 @@ gorgias_state_table = aws.dynamodb.Table(
 pulumi.export("gorgias_state_table_name", gorgias_state_table.name)
 
 # -------------------------
-# ✅ Shared roles for non-customer orchestrated streams (tickets/users/messages/surveys)
-#    - Do NOT touch customers roles below
+# Shared roles for orchestrated streams (tickets/users/messages/surveys)
 # -------------------------
-
 gorgias_streams_worker_role = aws.iam.Role(
     "gorgias-streams-worker-role",
     assume_role_policy=assume_role_policy,
@@ -164,19 +162,16 @@ aws.iam.RolePolicyAttachment(
     role=gorgias_streams_worker_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
 )
-
 aws.iam.RolePolicyAttachment(
     "gorgias-streams-worker-sqs-exec",
     role=gorgias_streams_worker_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
 )
-
 aws.iam.RolePolicy(
     "gorgias-streams-worker-secrets",
     role=gorgias_streams_worker_role.id,
     policy=secrets_read_policy,
 )
-
 aws.iam.RolePolicy(
     "gorgias-streams-worker-s3put",
     role=gorgias_streams_worker_role.id,
@@ -191,7 +186,6 @@ aws.iam.RolePolicy(
       ]
     }}""",
 )
-
 aws.iam.RolePolicy(
     "gorgias-streams-worker-ddb",
     role=gorgias_streams_worker_role.id,
@@ -217,7 +211,6 @@ aws.iam.RolePolicyAttachment(
     role=gorgias_streams_orchestrator_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
 )
-
 aws.iam.RolePolicy(
     "gorgias-streams-orchestrator-ddb",
     role=gorgias_streams_orchestrator_role.id,
@@ -234,15 +227,11 @@ aws.iam.RolePolicy(
 )
 
 # -------------------------
-# Legacy FIFO streams (kept so Pulumi won't delete existing FIFO resources)
+# Legacy FIFO streams (OPTIONAL)
+# Keep these only if you still want the old FIFO infra to exist.
+# If you remove these, Pulumi will delete old FIFO queues/lambdas/roles.
 # -------------------------
 def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
-    """
-    Legacy pattern (kept so Pulumi won't delete existing FIFO resources):
-      - FIFO SQS queue
-      - Lambda with self-send permission
-      - Event source mapping
-    """
     queue = aws.sqs.Queue(
         f"gorgias-{name}-queue",
         name=f"gorgias-{name}.fifo",
@@ -261,19 +250,16 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         role=role.id,
         policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
     )
-
     aws.iam.RolePolicyAttachment(
         f"gorgias-{name}-sqs-exec",
         role=role.id,
         policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
     )
-
     aws.iam.RolePolicy(
         f"gorgias-{name}-secrets",
         role=role.id,
         policy=secrets_read_policy,
     )
-
     aws.iam.RolePolicy(
         f"gorgias-{name}-s3put",
         role=role.id,
@@ -288,7 +274,6 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
           ]
         }}""",
     )
-
     aws.iam.RolePolicy(
         f"gorgias-{name}-sqssend",
         role=role.id,
@@ -334,9 +319,7 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
 
 
 # -------------------------
-# Orchestrated streams (tickets/users/messages/surveys) — now using shared roles
-# NOTE: resource names keep "-33d-" to avoid breaking existing infra names.
-#       You can later rename if you accept resource replacement.
+# Orchestrated streams (no "33d"; use "-backfill-" to avoid FIFO name collisions)
 # -------------------------
 def make_gorgias_orchestrated_stream(
     name: str,
@@ -345,25 +328,14 @@ def make_gorgias_orchestrated_stream(
     schedule_expression: str = "rate(1 minute)",
     max_concurrency: int = 1,
 ):
-    """
-    Orchestrated pattern (same as customers):
-      - Standard SQS queue + DLQ
-      - Worker Lambda reads SQS, writes S3, updates DDB
-      - Orchestrator Lambda runs on EventBridge, enqueues ONE message per tick
-      - Orchestrator disables its rule once job is DONE/ERROR
-
-    Uses:
-      - shared worker role: gorgias_streams_worker_role
-      - shared orchestrator role: gorgias_streams_orchestrator_role
-    """
     dlq = aws.sqs.Queue(
-        f"gorgias-{name}-33d-dlq",
-        name=f"gorgias-{name}-33d-dlq",
+        f"gorgias-{name}-backfill-dlq",
+        name=f"gorgias-{name}-backfill-dlq",
     )
 
     q = aws.sqs.Queue(
-        f"gorgias-{name}-33d-queue",
-        name=f"gorgias-{name}-33d-queue",
+        f"gorgias-{name}-backfill-queue",
+        name=f"gorgias-{name}-backfill-queue",
         visibility_timeout_seconds=900,
         redrive_policy=dlq.arn.apply(lambda arn: f"""{{
           "deadLetterTargetArn": "{arn}",
@@ -371,11 +343,11 @@ def make_gorgias_orchestrated_stream(
         }}"""),
     )
 
-    pulumi.export(f"gorgias_{name}_33d_queue_url", q.url)
+    pulumi.export(f"gorgias_{name}_backfill_queue_url", q.url)
 
     # Worker lambda (shared worker role)
     fn = aws.lambda_.Function(
-        f"gorgias-{name}-33d-lambda",
+        f"gorgias-{name}-backfill-lambda",
         role=gorgias_streams_worker_role.arn,
         runtime="python3.13",
         handler=handler,
@@ -390,31 +362,29 @@ def make_gorgias_orchestrated_stream(
                 "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
                 "PAGE_SIZE": "100",
                 "PAGES_PER_INVOCATION": "5",
-                # IMPORTANT:
-                # We are NOT forcing a 33d cutoff here anymore. If your lambda code still reads
-                # CUTOFF_DAYS/FILTER_TO_CUTOFF, set FILTER_TO_CUTOFF=false there or ignore them.
                 "FILTER_TO_CUTOFF": "false",
+                "STREAM_NAME": name,
             }
         ),
     )
 
     aws.lambda_.EventSourceMapping(
-        f"gorgias-{name}-33d-esm",
+        f"gorgias-{name}-backfill-esm",
         event_source_arn=q.arn,
         function_name=fn.arn,
         batch_size=1,
     )
 
-    pulumi.export(f"gorgias_{name}_33d_lambda_name", fn.name)
+    pulumi.export(f"gorgias_{name}_backfill_lambda_name", fn.name)
 
-    # EventBridge rule
+    # EventBridge rule (set explicit AWS name for easy CLI enable/disable)
     rule = aws.cloudwatch.EventRule(
-        f"gorgias-{name}-33d-orchestrator-rule",
+        f"gorgias-{name}-backfill-orchestrator-rule",
+        name=f"gorgias-{name}-backfill-orchestrator-rule",
         schedule_expression=schedule_expression,
     )
 
-    # Attach per-stream permissions to the SHARED orchestrator role:
-    # 1) allow SendMessage to THIS stream queue
+    # Per-stream permissions attached to the SHARED orchestrator role
     aws.iam.RolePolicy(
         f"gorgias-streams-orch-{name}-sqs-send",
         role=gorgias_streams_orchestrator_role.id,
@@ -430,7 +400,6 @@ def make_gorgias_orchestrated_stream(
         }}"""),
     )
 
-    # 2) allow DisableRule for THIS stream rule
     aws.iam.RolePolicy(
         f"gorgias-streams-orch-{name}-events-disable",
         role=gorgias_streams_orchestrator_role.id,
@@ -446,9 +415,8 @@ def make_gorgias_orchestrated_stream(
         }}"""),
     )
 
-    # Orchestrator lambda (shared orchestrator role)
     orch_fn = aws.lambda_.Function(
-        f"gorgias-{name}-33d-orchestrator-lambda",
+        f"gorgias-{name}-backfill-orchestrator-lambda",
         role=gorgias_streams_orchestrator_role.arn,
         runtime="python3.13",
         handler="gorgias_orchestrator.orchestrator.handler",
@@ -462,49 +430,47 @@ def make_gorgias_orchestrated_stream(
                 "ORCHESTRATOR_RULE_NAME": rule.name,
                 "VISIBILITY_TIMEOUT_SEC": "900",
                 "LEASE_BUFFER_SEC": "60",
+                "STREAM_NAME": name,
             }
         ),
     )
 
     aws.cloudwatch.EventTarget(
-        f"gorgias-{name}-33d-orchestrator-target",
+        f"gorgias-{name}-backfill-orchestrator-target",
         rule=rule.name,
         arn=orch_fn.arn,
         input=json.dumps({"job_start_id": job_start_id}),
     )
 
     aws.lambda_.Permission(
-        f"gorgias-{name}-33d-orchestrator-invoke",
+        f"gorgias-{name}-backfill-orchestrator-invoke",
         action="lambda:InvokeFunction",
         function=orch_fn.name,
         principal="events.amazonaws.com",
         source_arn=rule.arn,
     )
 
-    pulumi.export(f"gorgias_{name}_33d_orchestrator_rule_name", rule.name)
-    pulumi.export(f"gorgias_{name}_33d_orchestrator_lambda_name", orch_fn.name)
+    pulumi.export(f"gorgias_{name}_backfill_orchestrator_rule_name", rule.name)
+    pulumi.export(f"gorgias_{name}_backfill_orchestrator_lambda_name", orch_fn.name)
 
     return q, fn
 
 
 # -------------------------
-# Keep legacy FIFO streams so Pulumi doesn't delete existing ones
+# OPTIONAL: keep legacy FIFO streams
 # -------------------------
 gorgias_tickets_fifo_q, gorgias_tickets_fifo_fn = make_gorgias_stream(
     "tickets",
     "gorgias_tickets.tickets.handler",
 )
-
 gorgias_surveys_fifo_q, gorgias_surveys_fifo_fn = make_gorgias_stream(
     "satisfaction_surveys",
     "gorgias_satisfaction_surveys.satisfaction_surveys.handler",
 )
-
 gorgias_users_fifo_q, gorgias_users_fifo_fn = make_gorgias_stream(
     "users",
     "gorgias_users.users.handler",
 )
-
 gorgias_messages_fifo_q, gorgias_messages_fifo_fn = make_gorgias_stream(
     "messages",
     "gorgias_messages.messages.handler",
@@ -547,19 +513,16 @@ aws.iam.RolePolicyAttachment(
     role=gorgias_customers_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
 )
-
 aws.iam.RolePolicyAttachment(
     "gorgias-customers-sqs-exec",
     role=gorgias_customers_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
 )
-
 aws.iam.RolePolicy(
     "gorgias-customers-secrets",
     role=gorgias_customers_role.id,
     policy=secrets_read_policy,
 )
-
 aws.iam.RolePolicy(
     "gorgias-customers-s3put",
     role=gorgias_customers_role.id,
@@ -574,7 +537,6 @@ aws.iam.RolePolicy(
       ]
     }}""",
 )
-
 aws.iam.RolePolicy(
     "gorgias-customers-ddb",
     role=gorgias_customers_role.id,
@@ -710,34 +672,34 @@ aws.lambda_.Permission(
 )
 
 # -------------------------
-# Other Gorgias streams (orchestrated) — shared roles now
+# Orchestrated Gorgias streams (job IDs no longer mention 33d)
 # -------------------------
-gorgias_tickets_33d_q, gorgias_tickets_33d_fn = make_gorgias_orchestrated_stream(
+gorgias_tickets_backfill_q, gorgias_tickets_backfill_fn = make_gorgias_orchestrated_stream(
     "tickets",
     "gorgias_tickets.tickets.handler",
-    job_start_id="gorgias_tickets_last_33d",
+    job_start_id="gorgias_tickets_backfill",
 )
 
-gorgias_surveys_33d_q, gorgias_surveys_33d_fn = make_gorgias_orchestrated_stream(
+gorgias_surveys_backfill_q, gorgias_surveys_backfill_fn = make_gorgias_orchestrated_stream(
     "satisfaction_surveys",
     "gorgias_satisfaction_surveys.satisfaction_surveys.handler",
-    job_start_id="gorgias_satisfaction_surveys_last_33d",
+    job_start_id="gorgias_satisfaction_surveys_backfill",
 )
 
-gorgias_users_33d_q, gorgias_users_33d_fn = make_gorgias_orchestrated_stream(
+gorgias_users_backfill_q, gorgias_users_backfill_fn = make_gorgias_orchestrated_stream(
     "users",
     "gorgias_users.users.handler",
-    job_start_id="gorgias_users_last_33d",
+    job_start_id="gorgias_users_backfill",
 )
 
-gorgias_messages_33d_q, gorgias_messages_33d_fn = make_gorgias_orchestrated_stream(
+gorgias_messages_backfill_q, gorgias_messages_backfill_fn = make_gorgias_orchestrated_stream(
     "messages",
     "gorgias_messages.messages.handler",
-    job_start_id="gorgias_messages_last_33d",
+    job_start_id="gorgias_messages_backfill",
 )
 
 # =========================
-# Exports (existing)
+# Exports
 # =========================
 pulumi.export("events_bucket_name", events_bucket.bucket)
 pulumi.export("events_lambda_function_name", events_lambda.name)
