@@ -290,8 +290,9 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     )
 
     fn = aws.lambda_.Function(
-        f"gorgias-{name}-lambda",
-        role=role.arn,
+        f"gorgias-{name}-backfill-lambda",
+        name=f"gorgias-{name}-bf",  # <= short AWS name
+        role=gorgias_streams_worker_role.arn,
         runtime="python3.13",
         handler=handler,
         code=gorgias_code,
@@ -300,11 +301,17 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         layers=[requests_layer.arn],
         environment=aws.lambda_.FunctionEnvironmentArgs(
             variables={
-                "BACKFILL_QUEUE_URL": queue.url,
+                "STATE_TABLE": gorgias_state_table.name,
+                "S3_BUCKET": GORGIAS_BUCKET_NAME,
+                "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
+                "PAGE_SIZE": "100",
+                "PAGES_PER_INVOCATION": "5",
+                "FILTER_TO_CUTOFF": "false",
                 "STREAM_NAME": name,
             }
         ),
     )
+
 
     aws.lambda_.EventSourceMapping(
         f"gorgias-{name}-esm",
@@ -417,6 +424,7 @@ def make_gorgias_orchestrated_stream(
 
     orch_fn = aws.lambda_.Function(
         f"gorgias-{name}-backfill-orchestrator-lambda",
+        name=f"gorgias-{name}-bf-orch",  # <= short AWS name
         role=gorgias_streams_orchestrator_role.arn,
         runtime="python3.13",
         handler="gorgias_orchestrator.orchestrator.handler",
@@ -434,6 +442,7 @@ def make_gorgias_orchestrated_stream(
             }
         ),
     )
+
 
     aws.cloudwatch.EventTarget(
         f"gorgias-{name}-backfill-orchestrator-target",
