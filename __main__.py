@@ -134,7 +134,6 @@ profiles_lambda = aws.lambda_.Function(
 
 GORGIAS_BUCKET_NAME = "sources-data"
 GORGIAS_S3_PREFIX = "gorgias"
-
 gorgias_code = pulumi.AssetArchive({".": pulumi.FileArchive("./lambda/gorgias")})
 
 # -------------------------
@@ -177,13 +176,11 @@ aws.iam.RolePolicy(
     role=gorgias_streams_worker_role.id,
     policy=f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["s3:PutObject"],
-          "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["s3:PutObject"],
+        "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+      }}]
     }}""",
 )
 aws.iam.RolePolicy(
@@ -191,13 +188,11 @@ aws.iam.RolePolicy(
     role=gorgias_streams_worker_role.id,
     policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
-          "Resource":"{arn}"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
     }}"""),
 )
 
@@ -216,20 +211,16 @@ aws.iam.RolePolicy(
     role=gorgias_streams_orchestrator_role.id,
     policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
-          "Resource":"{arn}"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
     }}"""),
 )
 
 # -------------------------
-# Legacy FIFO streams (OPTIONAL)
-# Keep these only if you still want the old FIFO infra to exist.
-# If you remove these, Pulumi will delete old FIFO queues/lambdas/roles.
+# Legacy FIFO streams (kept so Pulumi won't delete existing FIFO resources)
 # -------------------------
 def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
     queue = aws.sqs.Queue(
@@ -265,13 +256,11 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         role=role.id,
         policy=f"""{{
           "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["s3:PutObject"],
-              "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
-            }}
-          ]
+          "Statement":[{{
+            "Effect":"Allow",
+            "Action":["s3:PutObject"],
+            "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+          }}]
         }}""",
     )
     aws.iam.RolePolicy(
@@ -279,20 +268,17 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         role=role.id,
         policy=queue.arn.apply(lambda arn: f"""{{
           "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["sqs:SendMessage"],
-              "Resource":"{arn}"
-            }}
-          ]
+          "Statement":[{{
+            "Effect":"Allow",
+            "Action":["sqs:SendMessage"],
+            "Resource":"{arn}"
+          }}]
         }}"""),
     )
 
     fn = aws.lambda_.Function(
-        f"gorgias-{name}-backfill-lambda",
-        name=f"gorgias-{name}-bf",  # <= short AWS name
-        role=gorgias_streams_worker_role.arn,
+        f"gorgias-{name}-lambda",
+        role=role.arn,
         runtime="python3.13",
         handler=handler,
         code=gorgias_code,
@@ -300,18 +286,9 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
         reserved_concurrent_executions=max_concurrency,
         layers=[requests_layer.arn],
         environment=aws.lambda_.FunctionEnvironmentArgs(
-            variables={
-                "STATE_TABLE": gorgias_state_table.name,
-                "S3_BUCKET": GORGIAS_BUCKET_NAME,
-                "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
-                "PAGE_SIZE": "100",
-                "PAGES_PER_INVOCATION": "5",
-                "FILTER_TO_CUTOFF": "false",
-                "STREAM_NAME": name,
-            }
+            variables={"BACKFILL_QUEUE_URL": queue.url, "STREAM_NAME": name}
         ),
     )
-
 
     aws.lambda_.EventSourceMapping(
         f"gorgias-{name}-esm",
@@ -326,7 +303,10 @@ def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
 
 
 # -------------------------
-# Orchestrated streams (no "33d"; use "-backfill-" to avoid FIFO name collisions)
+# Orchestrated streams (no "33d"; use "-backfill-" to avoid FIFO collisions)
+# Fixes:
+#   - short AWS Lambda names (avoid 64-char limit)
+#   - unique Pulumi logical names (avoid duplicate URN)
 # -------------------------
 def make_gorgias_orchestrated_stream(
     name: str,
@@ -353,8 +333,9 @@ def make_gorgias_orchestrated_stream(
     pulumi.export(f"gorgias_{name}_backfill_queue_url", q.url)
 
     # Worker lambda (shared worker role)
-    fn = aws.lambda_.Function(
-        f"gorgias-{name}-backfill-lambda",
+    worker_fn = aws.lambda_.Function(
+        f"gorgias-{name}-backfill-worker",     # Pulumi logical name (unique)
+        name=f"gorgias-{name}-bf",             # AWS name (short)
         role=gorgias_streams_worker_role.arn,
         runtime="python3.13",
         handler=handler,
@@ -378,53 +359,51 @@ def make_gorgias_orchestrated_stream(
     aws.lambda_.EventSourceMapping(
         f"gorgias-{name}-backfill-esm",
         event_source_arn=q.arn,
-        function_name=fn.arn,
+        function_name=worker_fn.arn,
         batch_size=1,
     )
 
-    pulumi.export(f"gorgias_{name}_backfill_lambda_name", fn.name)
+    pulumi.export(f"gorgias_{name}_backfill_lambda_name", worker_fn.name)
 
-    # EventBridge rule (set explicit AWS name for easy CLI enable/disable)
+    # EventBridge rule (explicit AWS name for easy CLI enable/disable)
     rule = aws.cloudwatch.EventRule(
         f"gorgias-{name}-backfill-orchestrator-rule",
         name=f"gorgias-{name}-backfill-orchestrator-rule",
         schedule_expression=schedule_expression,
     )
 
-    # Per-stream permissions attached to the SHARED orchestrator role
+    # Allow shared orchestrator role to SendMessage to this queue
     aws.iam.RolePolicy(
         f"gorgias-streams-orch-{name}-sqs-send",
         role=gorgias_streams_orchestrator_role.id,
         policy=q.arn.apply(lambda arn: f"""{{
           "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["sqs:SendMessage"],
-              "Resource":"{arn}"
-            }}
-          ]
+          "Statement":[{{
+            "Effect":"Allow",
+            "Action":["sqs:SendMessage"],
+            "Resource":"{arn}"
+          }}]
         }}"""),
     )
 
+    # Allow shared orchestrator role to disable this rule
     aws.iam.RolePolicy(
         f"gorgias-streams-orch-{name}-events-disable",
         role=gorgias_streams_orchestrator_role.id,
         policy=rule.arn.apply(lambda rule_arn: f"""{{
           "Version":"2012-10-17",
-          "Statement":[
-            {{
-              "Effect":"Allow",
-              "Action":["events:DisableRule"],
-              "Resource":"{rule_arn}"
-            }}
-          ]
+          "Statement":[{{
+            "Effect":"Allow",
+            "Action":["events:DisableRule"],
+            "Resource":"{rule_arn}"
+          }}]
         }}"""),
     )
 
+    # Orchestrator lambda (shared orchestrator role)
     orch_fn = aws.lambda_.Function(
-        f"gorgias-{name}-backfill-orchestrator-lambda",
-        name=f"gorgias-{name}-bf-orch",  # <= short AWS name
+        f"gorgias-{name}-backfill-orchestrator",  # Pulumi logical name (unique)
+        name=f"gorgias-{name}-bf-orch",           # AWS name (short)
         role=gorgias_streams_orchestrator_role.arn,
         runtime="python3.13",
         handler="gorgias_orchestrator.orchestrator.handler",
@@ -442,7 +421,6 @@ def make_gorgias_orchestrated_stream(
             }
         ),
     )
-
 
     aws.cloudwatch.EventTarget(
         f"gorgias-{name}-backfill-orchestrator-target",
@@ -462,11 +440,11 @@ def make_gorgias_orchestrated_stream(
     pulumi.export(f"gorgias_{name}_backfill_orchestrator_rule_name", rule.name)
     pulumi.export(f"gorgias_{name}_backfill_orchestrator_lambda_name", orch_fn.name)
 
-    return q, fn
+    return q, worker_fn
 
 
 # -------------------------
-# OPTIONAL: keep legacy FIFO streams
+# Keep legacy FIFO streams (so Pulumi doesn't delete existing ones)
 # -------------------------
 gorgias_tickets_fifo_q, gorgias_tickets_fifo_fn = make_gorgias_stream(
     "tickets",
@@ -537,13 +515,11 @@ aws.iam.RolePolicy(
     role=gorgias_customers_role.id,
     policy=f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["s3:PutObject"],
-          "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["s3:PutObject"],
+        "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+      }}]
     }}""",
 )
 aws.iam.RolePolicy(
@@ -551,13 +527,11 @@ aws.iam.RolePolicy(
     role=gorgias_customers_role.id,
     policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
-          "Resource":"{arn}"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
     }}"""),
 )
 
@@ -599,49 +573,40 @@ aws.iam.RolePolicyAttachment(
     role=gorgias_orchestrator_role.id,
     policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
 )
-
 aws.iam.RolePolicy(
     "gorgias-orchestrator-ddb",
     role=gorgias_orchestrator_role.id,
     policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
-          "Resource":"{arn}"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
     }}"""),
 )
-
 aws.iam.RolePolicy(
     "gorgias-orchestrator-sqs-send",
     role=gorgias_orchestrator_role.id,
     policy=gorgias_customers_q.arn.apply(lambda arn: f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["sqs:SendMessage"],
-          "Resource":"{arn}"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["sqs:SendMessage"],
+        "Resource":"{arn}"
+      }}]
     }}"""),
 )
-
 aws.iam.RolePolicy(
     "gorgias-orchestrator-events-disable",
     role=gorgias_orchestrator_role.id,
     policy=gorgias_orchestrator_rule.arn.apply(lambda rule_arn: f"""{{
       "Version":"2012-10-17",
-      "Statement":[
-        {{
-          "Effect":"Allow",
-          "Action":["events:DisableRule"],
-          "Resource":"{rule_arn}"
-        }}
-      ]
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["events:DisableRule"],
+        "Resource":"{rule_arn}"
+      }}]
     }}"""),
 )
 
@@ -681,7 +646,7 @@ aws.lambda_.Permission(
 )
 
 # -------------------------
-# Orchestrated Gorgias streams (job IDs no longer mention 33d)
+# Orchestrated Gorgias streams (no 33d anywhere)
 # -------------------------
 gorgias_tickets_backfill_q, gorgias_tickets_backfill_fn = make_gorgias_orchestrated_stream(
     "tickets",
