@@ -426,6 +426,7 @@ def make_gorgias_orchestrated_stream(
         f"gorgias-{name}-backfill-orchestrator-target",
         rule=rule.name,
         arn=orch_fn.arn,
+        target_id=f"g-{name}-bf",
         input=json.dumps({"job_start_id": job_start_id}),
     )
 
