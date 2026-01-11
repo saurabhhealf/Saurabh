@@ -1,556 +1,289 @@
-import json
 import os
+import json
 import time
+import uuid
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import requests
-from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# AWS clients
-_s3 = boto3.client("s3")
-_secrets = boto3.client("secretsmanager")
 _ddb = boto3.resource("dynamodb")
+_s3 = boto3.client("s3")
+_sm = boto3.client("secretsmanager")
 
-# Config
-GORGIAS_BASE_URL = os.environ.get("GORGIAS_BASE_URL", "https://healf-uk.gorgias.com/api")
-
-S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
-S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias")
-
+GORGIAS_BASE_URL = os.environ.get("GORGIAS_BASE_URL", "https://healf-uk.gorgias.com/api").rstrip("/")
 STATE_TABLE = os.environ["STATE_TABLE"]
-TABLE = _ddb.Table(STATE_TABLE)
+S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
+S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias").strip("/")
+
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
+PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "20"))
+
+GORGIAS_EMAIL_SECRET = os.environ.get("GORGIAS_EMAIL_SECRET", "gorgias_email")
+GORGIAS_API_KEY_SECRET = os.environ.get("GORGIAS_API_KEY_SECRET", "gorgias_api_key")
 
 STREAM_NAME = "users"
 ENDPOINT = "/users"
 
-# Ordering / default direction
-USE_ORDER_BY = os.environ.get("USE_ORDER_BY", "true").lower() in ("1", "true", "yes", "y")
-ORDER_BY_FIELD = "updated_datetime"
-DIRECTION_DEFAULT = "desc"
-
-# Windowing
-CUTOFF_DAYS = int(os.environ.get("CUTOFF_DAYS", "33"))
-CUTOFF_FIELD = "updated_datetime"
-FILTER_TO_CUTOFF = os.environ.get("FILTER_TO_CUTOFF", "true").lower() in ("1", "true", "yes", "y")
-
-# Paging / throttling
-PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
-REQUEST_TIMEOUT = (10, 60)
-
-PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "5"))
-SLEEP_BETWEEN_REQUESTS_SEC = float(os.environ.get("SLEEP_BETWEEN_REQUESTS_SEC", "0.0"))
-
-# Secrets Manager
-SECRET_GORGIAS_EMAIL = "gorgias_email"
-SECRET_GORGIAS_API_KEY = "gorgias_api_key"
-
-_cached_email: Optional[str] = None
-_cached_key: Optional[str] = None
+TABLE = _ddb.Table(STATE_TABLE)
 
 
-def get_secret_string(secret_name: str) -> str:
-    r = _secrets.get_secret_value(SecretId=secret_name)
-    if r.get("SecretString"):
-        return r["SecretString"]
-    return r["SecretBinary"].decode("utf-8")
+def _utc_now_ts() -> int:
+    return int(time.time())
 
 
-def get_gorgias_auth() -> Tuple[str, str]:
-    global _cached_email, _cached_key
-    if _cached_email and _cached_key:
-        return (_cached_email, _cached_key)
-
-    email_raw = get_secret_string(SECRET_GORGIAS_EMAIL).strip()
-    key_raw = get_secret_string(SECRET_GORGIAS_API_KEY).strip()
-
-    # email secret can be plaintext OR JSON key/value
+def _safe_json_loads(s: str) -> Any:
     try:
-        obj = json.loads(email_raw)
-        if isinstance(obj, dict):
-            email_raw = obj.get("GORGIAS_EMAIL") or obj.get("email") or obj.get("value") or email_raw
-    except Exception:
-        pass
-
-    # api key secret can be plaintext OR JSON key/value
-    try:
-        obj = json.loads(key_raw)
-        if isinstance(obj, dict):
-            key_raw = obj.get("GORGIAS_API_KEY") or obj.get("api_key") or obj.get("key") or obj.get("value") or key_raw
-    except Exception:
-        pass
-
-    email_raw = str(email_raw).strip().strip('"').strip("'")
-    key_raw = str(key_raw).strip().strip('"').strip("'")
-
-    if not email_raw or not key_raw:
-        raise RuntimeError("Gorgias email/api key secrets are empty after parsing")
-
-    _cached_email, _cached_key = email_raw, key_raw
-    return (_cached_email, _cached_key)
-
-
-def parse_iso_utc(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        s = str(s).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        return json.loads(s)
     except Exception:
         return None
 
 
-def _parse_dateish_to_utc_bound(value: Optional[str], is_end: bool) -> Optional[datetime]:
-    """
-    Accepts:
-      - YYYY-MM-DD
-      - DD-MM-YYYY
-      - full ISO datetime (with/without tz)
-    Returns UTC datetime bound:
-      - start => 00:00:00Z
-      - end   => 23:59:59.999999Z
-    """
-    if not value:
-        return None
-    v = str(value).strip().strip('"').strip("'")
-    if not v:
-        return None
-
-    # ISO datetime
-    dt = parse_iso_utc(v)
-    if dt:
-        return dt
-
-    fmts = ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y")
-    for fmt in fmts:
-        try:
-            d = datetime.strptime(v, fmt).date()
-            if is_end:
-                return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
-            return datetime(d.year, d.month, d.day, 0, 0, 0, 0, tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-    raise ValueError(f"Unrecognized date format: {value!r}")
+def _get_secret_value(secret_id: str) -> str:
+    resp = _sm.get_secret_value(SecretId=secret_id)
+    secret = (resp.get("SecretString") or "").strip()
+    parsed = _safe_json_loads(secret)
+    if isinstance(parsed, dict):
+        for k in ["value", "secret", "token", "api_key", "apiKey", "key", "password", "email", "username"]:
+            if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
+                return parsed[k].strip()
+    return secret
 
 
-def compute_cutoff_dt(now_utc: Optional[datetime] = None) -> datetime:
-    now_utc = now_utc or datetime.now(timezone.utc)
-    return now_utc - timedelta(days=CUTOFF_DAYS)
+def _gorgias_auth() -> Tuple[str, str]:
+    email = _get_secret_value(GORGIAS_EMAIL_SECRET)
+    api_key = _get_secret_value(GORGIAS_API_KEY_SECRET)
+    if not email or not api_key:
+        raise ValueError("Missing Gorgias credentials")
+    return email, api_key
 
 
-def resolve_window(job: Dict[str, Any]) -> Tuple[datetime, datetime, str]:
-    """
-    Returns (start_dt_utc, end_dt_utc, mode) where mode is:
-      - "range" if explicit dates provided
-      - "cutoff_days" if fallback to last N days
-    """
-    start_raw = job.get("start_date") or os.environ.get("START_DATE")
-    end_raw = job.get("end_date") or os.environ.get("END_DATE")
-
-    start_dt = _parse_dateish_to_utc_bound(start_raw, is_end=False)
-    end_dt = _parse_dateish_to_utc_bound(end_raw, is_end=True)
-
-    if start_dt and end_dt:
-        if end_dt < start_dt:
-            raise ValueError(f"end_date < start_date: start={start_dt.isoformat()} end={end_dt.isoformat()}")
-        return start_dt, end_dt, "range"
-
-    # fallback: last N days up to now
-    cutoff_dt = compute_cutoff_dt()
-    now_dt = datetime.now(timezone.utc)
-    return cutoff_dt, now_dt, "cutoff_days"
-
-
-def make_session() -> requests.Session:
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5, max_retries=0)
-    session.mount("https://", adapter)
-    return session
-
-
-def _maybe_adaptive_sleep(headers: Dict[str, str]) -> None:
-    limit_hdr = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
-    if not limit_hdr:
-        return
-    try:
-        used_s, limit_s = limit_hdr.split("/", 1)
-        used = int(used_s.strip())
-        limit = int(limit_s.strip())
-        if limit > 0 and used / limit >= 0.9:
-            time.sleep(2.0)
-    except Exception:
-        return
-
-
-def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    url = f"{GORGIAS_BASE_URL}{path}"
-    auth = get_gorgias_auth()
-
-    while True:
-        r = session.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
-
-        if r.status_code == 429:
-            retry_after = int(r.headers.get("Retry-After", 10))
-            logger.warning(f"[{STREAM_NAME}] 429 rate limited. sleeping {retry_after}s")
-            time.sleep(retry_after + 1)
-            continue
-
-        # If order_by isn't supported for this endpoint, retry once without it.
-        if r.status_code == 400 and USE_ORDER_BY and "order_by" in params:
-            logger.warning(f"[{STREAM_NAME}] 400 with order_by, retrying once without order_by. url={r.url}")
-            params = dict(params)
-            params.pop("order_by", None)
-            r = session.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
-
-        if r.status_code >= 400:
-            logger.error(f"[{STREAM_NAME}] ERROR url={r.url} status={r.status_code} body={r.text[:1200]}")
-        r.raise_for_status()
-
-        headers = {k: v for k, v in r.headers.items()}
-        _maybe_adaptive_sleep(headers)
-        return r.json(), headers
-
-
-def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
-    raw = json.dumps(payload).encode("utf-8")
-    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=raw, ContentType="application/json")
-
-
-def time_budget_ok(context: Any, buffer_ms: int = 70_000) -> bool:
+def _time_left_ok(context, buffer_ms: int = 12_000) -> bool:
     if context is None:
         return True
-    return context.get_remaining_time_in_millis() > buffer_ms
+    try:
+        return context.get_remaining_time_in_millis() > buffer_ms
+    except Exception:
+        return True
 
 
-def _release_lease(job_start_id: str) -> None:
-    now = int(time.time())
+def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]]) -> str:
+    if not records:
+        return ""
+    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = (
+        f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/"
+        f"page={page:06d}-{int(time.time())}-{uuid.uuid4().hex}.json"
+    )
+    body = "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records)
+    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
+    logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
+    return key
+
+
+def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]:
+    return TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
+
+
+def _ddb_update_running(job_start_id: str, next_page: int, next_cursor: Optional[str], note: str = "") -> None:
+    now = _utc_now_ts()
+    expr = "SET #status=:running, #in_flight=:false, #lease_until=:zero, #page=:p, #updated_at=:now"
+    names = {
+        "#status": "status",
+        "#in_flight": "in_flight",
+        "#lease_until": "lease_until",
+        "#page": "page",
+        "#updated_at": "updated_at",
+    }
+    vals: Dict[str, Any] = {
+        ":running": "RUNNING",
+        ":false": False,
+        ":zero": 0,
+        ":p": next_page,
+        ":now": now,
+    }
+    if next_cursor:
+        expr += ", #cursor=:c"
+        names["#cursor"] = "cursor"
+        vals[":c"] = next_cursor
+    else:
+        expr += " REMOVE #cursor"
+        names["#cursor"] = "cursor"
+    if note:
+        expr += ", #note=:n"
+        names["#note"] = "note"
+        vals[":n"] = note[:2000]
+
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
-        UpdateExpression="SET #in_flight = :false, #lease_until = :zero, #updated_at = :now",
-        ExpressionAttributeNames={"#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at"},
-        ExpressionAttributeValues={":false": False, ":zero": 0, ":now": now},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=vals,
     )
 
 
-def _ddb_mark_done(job_start_id: str, expected_cursor: Optional[str], expected_page: int) -> None:
-    now = int(time.time())
-
-    if expected_cursor is None:
-        cursor_condition = "attribute_not_exists(#cursor)"
-        eav = {
-            ":running": "RUNNING",
-            ":done": "DONE",
-            ":expected_page": expected_page,
-            ":true": True,
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        }
-    else:
-        cursor_condition = "#cursor = :expected_cursor"
-        eav = {
-            ":running": "RUNNING",
-            ":done": "DONE",
-            ":expected_page": expected_page,
-            ":expected_cursor": expected_cursor,
-            ":true": True,
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        }
-
-    try:
-        TABLE.update_item(
-            Key={"job_start_id": job_start_id},
-            ConditionExpression=(
-                "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
-                f"({cursor_condition})"
-            ),
-            UpdateExpression=(
-                "SET #status = :done, #in_flight = :false, #lease_until = :zero, #updated_at = :now "
-                "REMOVE #cursor"
-            ),
-            ExpressionAttributeNames={
-                "#status": "status",
-                "#page": "page",
-                "#cursor": "cursor",
-                "#in_flight": "in_flight",
-                "#lease_until": "lease_until",
-                "#updated_at": "updated_at",
-            },
-            ExpressionAttributeValues=eav,
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(f"[{STREAM_NAME}] DDB conditional failed (DONE). Likely duplicate/out-of-order. job={job_start_id}")
-            _release_lease(job_start_id)
-            return
-        raise
-
-
-def _ddb_update_progress(
-    job_start_id: str,
-    expected_cursor: Optional[str],
-    expected_page: int,
-    next_cursor: str,
-    next_page: int,
-) -> None:
-    now = int(time.time())
-
-    if expected_cursor is None:
-        cursor_condition = "attribute_not_exists(#cursor)"
-        eav = {
-            ":running": "RUNNING",
-            ":expected_page": expected_page,
-            ":true": True,
-            ":false": False,
-            ":next_cursor": next_cursor,
-            ":next_page": next_page,
-            ":zero": 0,
-            ":now": now,
-        }
-    else:
-        cursor_condition = "#cursor = :expected_cursor"
-        eav = {
-            ":running": "RUNNING",
-            ":expected_page": expected_page,
-            ":expected_cursor": expected_cursor,
-            ":true": True,
-            ":false": False,
-            ":next_cursor": next_cursor,
-            ":next_page": next_page,
-            ":zero": 0,
-            ":now": now,
-        }
-
-    try:
-        TABLE.update_item(
-            Key={"job_start_id": job_start_id},
-            ConditionExpression=(
-                "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
-                f"({cursor_condition})"
-            ),
-            UpdateExpression=(
-                "SET #cursor = :next_cursor, #page = :next_page, #in_flight = :false, "
-                "#lease_until = :zero, #updated_at = :now REMOVE #last_error"
-            ),
-            ExpressionAttributeNames={
-                "#status": "status",
-                "#page": "page",
-                "#cursor": "cursor",
-                "#in_flight": "in_flight",
-                "#lease_until": "lease_until",
-                "#updated_at": "updated_at",
-                "#last_error": "last_error",
-            },
-            ExpressionAttributeValues=eav,
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(
-                f"[{STREAM_NAME}] DDB conditional failed (PROGRESS). Likely duplicate/out-of-order. job={job_start_id}"
-            )
-            _release_lease(job_start_id)
-            return
-        raise
-
-
-def _ddb_record_error(job_start_id: str, err: str) -> None:
-    now = int(time.time())
+def _ddb_done(job_start_id: str, note: str = "") -> None:
+    now = _utc_now_ts()
+    expr = "SET #status=:done, #in_flight=:false, #lease_until=:zero, #updated_at=:now"
+    names = {
+        "#status": "status",
+        "#in_flight": "in_flight",
+        "#lease_until": "lease_until",
+        "#updated_at": "updated_at",
+    }
+    vals: Dict[str, Any] = {":done": "DONE", ":false": False, ":zero": 0, ":now": now}
+    if note:
+        expr += ", #note=:n"
+        names["#note"] = "note"
+        vals[":n"] = note[:2000]
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
-        UpdateExpression="SET #last_error = :e, #in_flight = :false, #lease_until = :zero, #updated_at = :now",
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=vals,
+    )
+
+
+def _ddb_error(job_start_id: str, err: str) -> None:
+    now = _utc_now_ts()
+    TABLE.update_item(
+        Key={"job_start_id": job_start_id},
+        UpdateExpression="SET #status=:err, #in_flight=:false, #lease_until=:zero, #updated_at=:now, #last_error=:e",
         ExpressionAttributeNames={
-            "#last_error": "last_error",
+            "#status": "status",
             "#in_flight": "in_flight",
             "#lease_until": "lease_until",
             "#updated_at": "updated_at",
+            "#last_error": "last_error",
         },
-        ExpressionAttributeValues={":e": err[:2000], ":false": False, ":zero": 0, ":now": now},
+        ExpressionAttributeValues={
+            ":err": "ERROR",
+            ":false": False,
+            ":zero": 0,
+            ":now": now,
+            ":e": (err or "")[:2000],
+        },
     )
 
 
-def _parse_record(rec: Dict[str, Any]) -> Dict[str, Any]:
-    body = rec.get("body", "{}")
-    return json.loads(body) if isinstance(body, str) else body
+def _parse_items(resp_json: Any) -> List[Dict[str, Any]]:
+    if isinstance(resp_json, dict):
+        for k in ["data", "items", "results", STREAM_NAME]:
+            v = resp_json.get(k)
+            if isinstance(v, list):
+                return v
+        for v in resp_json.values():
+            if isinstance(v, list):
+                return v
+    if isinstance(resp_json, list):
+        return resp_json
+    return []
 
 
-def _apply_window(
-    items: List[Dict[str, Any]],
-    start_dt: datetime,
-    end_dt: datetime,
-) -> Tuple[List[Dict[str, Any]], bool, Optional[datetime], Optional[datetime], int, int, int]:
-    """
-    Returns:
-      (filtered_items, reached_start, min_dt, max_dt, original_count, kept_count, skipped_newer_than_end_count)
-
-    reached_start means: we paged far enough back that at least one item is older than start_dt.
-    We still filter to [start_dt, end_dt] inclusive.
-    """
-    dts: List[datetime] = []
-    newer_than_end = 0
-
-    for it in items:
-        dt = parse_iso_utc(it.get(CUTOFF_FIELD))
-        if dt:
-            dts.append(dt)
-            if dt > end_dt:
-                newer_than_end += 1
-
-    if not dts:
-        return items, False, None, None, len(items), len(items), 0
-
-    min_dt = min(dts)
-    max_dt = max(dts)
-
-    reached_start = min_dt < start_dt
-
-    if not FILTER_TO_CUTOFF:
-        return items, reached_start, min_dt, max_dt, len(items), len(items), newer_than_end
-
-    filtered: List[Dict[str, Any]] = []
-    for it in items:
-        dt = parse_iso_utc(it.get(CUTOFF_FIELD))
-        if not dt:
-            filtered.append(it)
-            continue
-        if start_dt <= dt <= end_dt:
-            filtered.append(it)
-
-    return filtered, reached_start, min_dt, max_dt, len(items), len(filtered), newer_than_end
+def _parse_next_cursor(resp_json: Any) -> Optional[str]:
+    if isinstance(resp_json, dict):
+        meta = resp_json.get("meta")
+        if isinstance(meta, dict):
+            for k in ["next_cursor", "nextCursor", "cursor_next", "cursorNext"]:
+                v = meta.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        for k in ["next_cursor", "nextCursor"]:
+            v = resp_json.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
 
 
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    records = event.get("Records", [])
-    logger.info(f"[{STREAM_NAME}] received_records={len(records)}")
+def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    email, api_key = _gorgias_auth()
+    url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
 
-    results: List[Dict[str, Any]] = []
+    params: Dict[str, Any] = {
+        "limit": PAGE_SIZE,
+        "per_page": PAGE_SIZE,
+        "page": page,
+        # ASC from the beginning
+        "order_by": "created_datetime",
+        "order_direction": "asc",
+        "sort": "created_datetime",
+        "direction": "asc",
+    }
+    if cursor:
+        params["cursor"] = cursor
 
-    for rec in records:
-        job = _parse_record(rec)
-        job_start_id = job["job_start_id"]
+    r = requests.get(url, params=params, auth=(email, api_key), timeout=60)
+    r.raise_for_status()
+    j = r.json()
+    return _parse_items(j), _parse_next_cursor(j)
 
-        # Expected state from the SQS message (used for conditional updates)
-        msg_cursor: Optional[str] = job.get("cursor")
-        msg_page: int = int(job.get("page", 1))
 
-        cursor = msg_cursor
-        page = msg_page
+def handler(event, context):
+    try:
+        record = (event.get("Records") or [None])[0]
+        body = json.loads(record["body"]) if record and record.get("body") else (event or {})
+        job_start_id = body.get("job_start_id")
+        if not job_start_id:
+            raise ValueError("Missing job_start_id")
 
-        direction = (job.get("direction") or DIRECTION_DEFAULT).lower()
+        state = _ddb_get(job_start_id)
+        if not state:
+            logger.warning(f"[{STREAM_NAME}] missing ddb state job={job_start_id}")
+            return {"ok": False, "reason": "missing_state"}
 
-        start_dt, end_dt, window_mode = resolve_window(job)
-        logger.info(
-            f"[{STREAM_NAME}] job={job_start_id} window_mode={window_mode} "
-            f"start_utc={start_dt.isoformat()} end_utc={end_dt.isoformat()}"
+        if state.get("status") != "RUNNING":
+            logger.info(f"[{STREAM_NAME}] job not RUNNING (status={state.get('status')}); skipping")
+            return {"ok": True, "skipped": True, "status": state.get("status")}
+
+        page = int(body.get("page") or state.get("page") or 1)
+        cursor = body.get("cursor") or state.get("cursor")
+
+        processed_pages = 0
+        total_rows = 0
+
+        while processed_pages < PAGES_PER_INVOCATION and _time_left_ok(context):
+            items, next_cursor = _fetch_page(page=page, cursor=cursor)
+
+            if not items:
+                _ddb_done(job_start_id, note=f"no_items page={page} cursor_present={bool(cursor)}")
+                return {"ok": True, "done": True, "rows": total_rows}
+
+            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
+
+            processed_pages += 1
+            total_rows += len(items)
+
+            if next_cursor:
+                cursor = next_cursor
+                page += 1
+            else:
+                if len(items) < PAGE_SIZE:
+                    _ddb_done(job_start_id, note=f"completed page={page} (short page)")
+                    return {"ok": True, "done": True, "rows": total_rows}
+                page += 1
+
+        _ddb_update_running(
+            job_start_id,
+            next_page=page,
+            next_cursor=cursor if cursor else None,
+            note=f"continuing pages_processed={processed_pages} rows={total_rows}",
         )
+        return {"ok": True, "done": False, "rows": total_rows, "next_page": page, "cursor_present": bool(cursor)}
 
-        session = make_session()
-        pages_written = 0
-
+    except Exception as e:
+        logger.exception(f"[{STREAM_NAME}] error")
         try:
-            while pages_written < PAGES_PER_INVOCATION and time_budget_ok(context):
-                params: Dict[str, Any] = {"limit": PAGE_SIZE}
-                if USE_ORDER_BY and ORDER_BY_FIELD:
-                    params["order_by"] = f"{ORDER_BY_FIELD}:{direction}"
-                if cursor:
-                    params["cursor"] = cursor
-
-                payload, headers = safe_get(session, ENDPOINT, params=params)
-                items = payload.get("data", []) or []
-                api_next_cursor = (payload.get("meta") or {}).get("next_cursor")
-
-                if not items:
-                    logger.info(f"[{STREAM_NAME}] empty page -> DONE job={job_start_id} page={page}")
-                    _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
-                    break
-
-                filtered_items, reached_start, min_dt, max_dt, original_count, kept_count, skipped_newer = _apply_window(
-                    items, start_dt, end_dt
-                )
-
-                if FILTER_TO_CUTOFF:
-                    payload = dict(payload)
-                    payload["data"] = filtered_items
-                    payload["_healf_window"] = {
-                        "mode": window_mode,
-                        "start_utc": start_dt.isoformat(),
-                        "end_utc": end_dt.isoformat(),
-                        "field": CUTOFF_FIELD,
-                        "direction": direction,
-                        "reached_start": reached_start,
-                        "min_dt": min_dt.isoformat() if min_dt else None,
-                        "max_dt": max_dt.isoformat() if max_dt else None,
-                        "original_count": original_count,
-                        "kept_count": kept_count,
-                        "skipped_newer_than_end_count": skipped_newer,
-                    }
-
-                # If we've already crossed start bound and kept nothing -> done (don't write)
-                if FILTER_TO_CUTOFF and kept_count == 0 and reached_start:
-                    logger.info(
-                        f"[{STREAM_NAME}] passed start bound and nothing kept -> DONE job={job_start_id} page={page}"
-                    )
-                    _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
-                    break
-
-                s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/job={job_start_id}/page={page:06d}.json"
-                s3_put_json(s3_key, payload)
-
-                limit_hdr = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
-                logger.info(
-                    f"[{STREAM_NAME}] WROTE job={job_start_id} page={page} kept={kept_count}/{original_count} "
-                    f"next_cursor_present={bool(api_next_cursor)} reached_start={reached_start} "
-                    f"rate_limit={limit_hdr!r} s3_key={s3_key}"
-                )
-
-                pages_written += 1
-
-                if reached_start:
-                    logger.info(f"[{STREAM_NAME}] reached start bound -> DONE job={job_start_id} last_page={page}")
-                    _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
-                    break
-
-                if not api_next_cursor:
-                    logger.info(f"[{STREAM_NAME}] no next_cursor -> DONE job={job_start_id} last_page={page}")
-                    _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
-                    break
-
-                _ddb_update_progress(
-                    job_start_id=job_start_id,
-                    expected_cursor=msg_cursor,
-                    expected_page=msg_page,
-                    next_cursor=api_next_cursor,
-                    next_page=page + 1,
-                )
-
-                msg_cursor = api_next_cursor
-                msg_page = page + 1
-                cursor = api_next_cursor
-                page = page + 1
-
-                if SLEEP_BETWEEN_REQUESTS_SEC > 0:
-                    time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
-
-        except Exception as e:
-            logger.exception(f"[{STREAM_NAME}] ERROR job={job_start_id}")
-            _ddb_record_error(job_start_id, str(e))
-            raise
-        finally:
-            if pages_written == 0:
-                _release_lease(job_start_id)
-
-        results.append({"job_start_id": job_start_id, "pages_written": pages_written})
-
-    return {"results": results}
+            job_start_id = None
+            if event and event.get("Records"):
+                body = json.loads(event["Records"][0]["body"])
+                job_start_id = body.get("job_start_id")
+            if job_start_id:
+                _ddb_error(job_start_id, str(e))
+        except Exception:
+            pass
+        raise
