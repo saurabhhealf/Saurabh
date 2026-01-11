@@ -1,8 +1,10 @@
-import json
 import os
+import json
 import time
+import uuid
 import logging
-from typing import Any, Dict, Optional, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import requests
@@ -11,78 +13,65 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# AWS clients
-_s3 = boto3.client("s3")
-_secrets = boto3.client("secretsmanager")
+# ---------- AWS clients ----------
 _ddb = boto3.resource("dynamodb")
+_s3 = boto3.client("s3")
+_sm = boto3.client("secretsmanager")
 
-# Config
-GORGIAS_BASE_URL = "https://healf-uk.gorgias.com/api"
-S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
-S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias")
-
+# ---------- Env ----------
+GORGIAS_BASE_URL = os.environ.get("GORGIAS_BASE_URL", "https://healf-uk.gorgias.com/api").rstrip("/")
 STATE_TABLE = os.environ["STATE_TABLE"]
-TABLE = _ddb.Table(STATE_TABLE)
-
-STREAM_NAME = "customers"
-ENDPOINT = "/customers"
-ORDER_BY_FIELD = "created_datetime"
-DIRECTION_DEFAULT = "asc"
+S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
+S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias").strip("/")
 
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
+# Use 100 to process more data per run (~10k records)
+PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "100"))
 REQUEST_TIMEOUT = (10, 60)
 
-PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "60"))
-SLEEP_BETWEEN_REQUESTS_SEC = float(os.environ.get("SLEEP_BETWEEN_REQUESTS_SEC", "0.0"))
+GORGIAS_EMAIL_SECRET = os.environ.get("GORGIAS_EMAIL_SECRET", "gorgias_email")
+GORGIAS_API_KEY_SECRET = os.environ.get("GORGIAS_API_KEY_SECRET", "gorgias_api_key")
 
-# Secrets Manager
-SECRET_GORGIAS_EMAIL = "gorgias_email"
-SECRET_GORGIAS_API_KEY = "gorgias_api_key"
+STREAM_NAME = "messages"
+ENDPOINT = "/messages"
 
-_cached_email: Optional[str] = None
-_cached_key: Optional[str] = None
+TABLE = _ddb.Table(STATE_TABLE)
 
+# ---------- Helpers ----------
+def _utc_now_ts() -> int: return int(time.time())
+def _safe_json_loads(s: str) -> Any:
+    try: return json.loads(s)
+    except: return None
 
-def get_secret_string(secret_name: str) -> str:
-    r = _secrets.get_secret_value(SecretId=secret_name)
-    if r.get("SecretString"):
-        return r["SecretString"]
-    return r["SecretBinary"].decode("utf-8")
+def _get_secret_value(secret_id: str) -> str:
+    resp = _sm.get_secret_value(SecretId=secret_id)
+    secret = (resp.get("SecretString") or "").strip()
+    parsed = _safe_json_loads(secret)
+    if isinstance(parsed, dict):
+        for k in ["GORGIAS_EMAIL", "GORGIAS_API_KEY", "value", "secret", "token", "api_key", "apiKey", "key", "password", "email", "username"]:
+            if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
+                return parsed[k].strip().strip('"').strip("'")
+    return secret.strip().strip('"').strip("'")
 
+def _gorgias_auth() -> Tuple[str, str]:
+    email = _get_secret_value(GORGIAS_EMAIL_SECRET)
+    api_key = _get_secret_value(GORGIAS_API_KEY_SECRET)
+    if not email or not api_key: raise ValueError("Missing Gorgias credentials")
+    return email, api_key
 
-def get_gorgias_auth() -> tuple[str, str]:
-    global _cached_email, _cached_key
-    if _cached_email and _cached_key:
-        return (_cached_email, _cached_key)
+def _time_left_ok(context, buffer_ms: int = 12_000) -> bool:
+    if context is None: return True
+    try: return context.get_remaining_time_in_millis() > buffer_ms
+    except: return True
 
-    email_raw = get_secret_string(SECRET_GORGIAS_EMAIL).strip()
-    key_raw = get_secret_string(SECRET_GORGIAS_API_KEY).strip()
-
-    # email secret can be plaintext OR JSON key/value
+def _maybe_adaptive_sleep(headers: Dict[str, str]) -> None:
+    limit_hdr = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
+    if not limit_hdr: return
     try:
-        obj = json.loads(email_raw)
-        if isinstance(obj, dict):
-            email_raw = obj.get("GORGIAS_EMAIL") or obj.get("email") or obj.get("value") or email_raw
-    except Exception:
-        pass
-
-    # api key secret can be plaintext OR JSON key/value
-    try:
-        obj = json.loads(key_raw)
-        if isinstance(obj, dict):
-            key_raw = obj.get("GORGIAS_API_KEY") or obj.get("api_key") or obj.get("key") or obj.get("value") or key_raw
-    except Exception:
-        pass
-
-    email_raw = str(email_raw).strip().strip('"').strip("'")
-    key_raw = str(key_raw).strip().strip('"').strip("'")
-
-    if not email_raw or not key_raw:
-        raise RuntimeError("Gorgias email/api key secrets are empty after parsing")
-
-    _cached_email, _cached_key = email_raw, key_raw
-    return (_cached_email, _cached_key)
-
+        used_s, limit_s = limit_hdr.split("/", 1)
+        if int(limit_s.strip()) > 0 and int(used_s.strip()) / int(limit_s.strip()) >= 0.9:
+            time.sleep(2.0)
+    except: pass
 
 def make_session() -> requests.Session:
     session = requests.Session()
@@ -90,10 +79,10 @@ def make_session() -> requests.Session:
     session.mount("https://", adapter)
     return session
 
-
-def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
     url = f"{GORGIAS_BASE_URL}{path}"
-    auth = get_gorgias_auth()
+    email, api_key = _gorgias_auth()
+    auth = (email, api_key)
 
     while True:
         r = session.get(url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
@@ -107,270 +96,124 @@ def safe_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Di
         if r.status_code >= 400:
             logger.error(f"[{STREAM_NAME}] ERROR url={r.url} status={r.status_code} body={r.text[:1200]}")
         r.raise_for_status()
-        return r.json()
 
+        headers = {k: v for k, v in r.headers.items()}
+        _maybe_adaptive_sleep(headers)
+        return r.json(), headers
 
-def s3_put_json(key: str, payload: Dict[str, Any]) -> None:
-    raw = json.dumps(payload).encode("utf-8")
-    _s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=raw,
-        ContentType="application/json",
-    )
+def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]]) -> str:
+    if not records: return ""
+    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Deterministic naming (page=000001.json)
+    key = f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/page={page:06d}.json"
+    body = "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records)
+    _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
+    logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
+    return key
 
+# ---------- DDB Helpers (FIXED: UNCONDITIONAL UPDATE) ----------
+def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]: 
+    return TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
 
-def time_budget_ok(context: Any, buffer_ms: int = 70_000) -> bool:
-    if context is None:
-        return True
-    return context.get_remaining_time_in_millis() > buffer_ms
+def _ddb_update_running(job_start_id: str, next_page: int, next_cursor: Optional[str], note: str = "") -> None:
+    now = _utc_now_ts()
+    # Unconditional update to fix the loop
+    expr = "SET #status=:running, #in_flight=:false, #lease_until=:zero, #page=:p, #updated_at=:now"
+    names = {"#status": "status", "#in_flight": "in_flight", "#lease_until": "lease_until", "#page": "page", "#updated_at": "updated_at"}
+    vals = {":running": "RUNNING", ":false": False, ":zero": 0, ":p": next_page, ":now": now}
+    if next_cursor:
+        expr += ", #cursor=:c"; names["#cursor"] = "cursor"; vals[":c"] = next_cursor
+    else:
+        expr += " REMOVE #cursor"; names["#cursor"] = "cursor"
+    if note: expr += ", #note=:n"; names["#note"] = "note"; vals[":n"] = note[:2000]
+    
+    TABLE.update_item(Key={"job_start_id": job_start_id}, UpdateExpression=expr, ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
 
+def _ddb_done(job_start_id: str, note: str = "") -> None:
+    now = _utc_now_ts()
+    expr = "SET #status=:done, #in_flight=:false, #lease_until=:zero, #updated_at=:now"
+    names = {"#status": "status", "#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at"}
+    vals = {":done": "DONE", ":false": False, ":zero": 0, ":now": now}
+    if note: expr += ", #note=:n"; names["#note"] = "note"; vals[":n"] = note[:2000]
+    TABLE.update_item(Key={"job_start_id": job_start_id}, UpdateExpression=expr, ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
 
+def _ddb_error(job_start_id: str, err: str) -> None:
+    now = _utc_now_ts()
+    TABLE.update_item(Key={"job_start_id": job_start_id}, UpdateExpression="SET #status=:err, #in_flight=:false, #lease_until=:zero, #updated_at=:now, #last_error=:e", ExpressionAttributeNames={"#status": "status", "#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at", "#last_error": "last_error"}, ExpressionAttributeValues={":err": "ERROR", ":false": False, ":zero": 0, ":now": now, ":e": (err or "")[:2000]})
+
+# ---------- Handler ----------
 def _release_lease(job_start_id: str) -> None:
+    # Helper for finally block
     now = int(time.time())
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
         UpdateExpression="SET #in_flight = :false, #lease_until = :zero, #updated_at = :now",
-        ExpressionAttributeNames={
-            "#in_flight": "in_flight",
-            "#lease_until": "lease_until",
-            "#updated_at": "updated_at",
-        },
-        ExpressionAttributeValues={
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        },
+        ExpressionAttributeNames={"#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at"},
+        ExpressionAttributeValues={":false": False, ":zero": 0, ":now": now}
     )
 
-
-def _ddb_mark_done(job_start_id: str, expected_cursor: Optional[str], expected_page: int) -> None:
-    now = int(time.time())
-
-    if expected_cursor is None:
-        cursor_condition = "attribute_not_exists(#cursor)"
-        eav = {
-            ":running": "RUNNING",
-            ":done": "DONE",
-            ":expected_page": expected_page,
-            ":true": True,
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        }
-    else:
-        cursor_condition = "#cursor = :expected_cursor"
-        eav = {
-            ":running": "RUNNING",
-            ":done": "DONE",
-            ":expected_page": expected_page,
-            ":expected_cursor": expected_cursor,
-            ":true": True,
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        }
-
+def handler(event, context):
     try:
-        TABLE.update_item(
-            Key={"job_start_id": job_start_id},
-            ConditionExpression=(
-                "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
-                f"({cursor_condition})"
-            ),
-            UpdateExpression="SET #status = :done, #in_flight = :false, #lease_until = :zero, #updated_at = :now REMOVE #cursor",
-            ExpressionAttributeNames={
-                "#status": "status",
-                "#page": "page",
-                "#cursor": "cursor",
-                "#in_flight": "in_flight",
-                "#lease_until": "lease_until",
-                "#updated_at": "updated_at",
-            },
-            ExpressionAttributeValues=eav,
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(f"[{STREAM_NAME}] DDB conditional failed (DONE). Likely duplicate/out-of-order. job={job_start_id}")
-            _release_lease(job_start_id)
-            return
-        raise
+        record = (event.get("Records") or [None])[0]
+        body = json.loads(record["body"]) if record and record.get("body") else (event or {})
+        job_start_id = body.get("job_start_id")
+        if not job_start_id: raise ValueError("Missing job_start_id")
 
+        state = _ddb_get(job_start_id)
+        if not state: return {"ok": False, "reason": "missing_state"}
+        if state.get("status") != "RUNNING": return {"ok": True, "skipped": True}
 
-def _ddb_update_progress(
-    job_start_id: str,
-    expected_cursor: Optional[str],
-    expected_page: int,
-    next_cursor: str,
-    next_page: int,
-) -> None:
-    now = int(time.time())
+        # Page for filename only
+        page = int(body.get("page") or state.get("page") or 1)
+        cursor = body.get("cursor") or state.get("cursor")
+        if cursor == "": cursor = None
 
-    if expected_cursor is None:
-        cursor_condition = "attribute_not_exists(#cursor)"
-        eav = {
-            ":running": "RUNNING",
-            ":expected_page": expected_page,
-            ":true": True,
-            ":false": False,
-            ":next_cursor": next_cursor,
-            ":next_page": next_page,
-            ":zero": 0,
-            ":now": now,
-        }
-    else:
-        cursor_condition = "#cursor = :expected_cursor"
-        eav = {
-            ":running": "RUNNING",
-            ":expected_page": expected_page,
-            ":expected_cursor": expected_cursor,
-            ":true": True,
-            ":false": False,
-            ":next_cursor": next_cursor,
-            ":next_page": next_page,
-            ":zero": 0,
-            ":now": now,
-        }
-
-    try:
-        TABLE.update_item(
-            Key={"job_start_id": job_start_id},
-            ConditionExpression=(
-                "#status = :running AND #page = :expected_page AND #in_flight = :true AND "
-                f"({cursor_condition})"
-            ),
-            UpdateExpression=(
-                "SET #cursor = :next_cursor, #page = :next_page, #in_flight = :false, "
-                "#lease_until = :zero, #updated_at = :now REMOVE #last_error"
-            ),
-            ExpressionAttributeNames={
-                "#status": "status",
-                "#page": "page",
-                "#cursor": "cursor",
-                "#in_flight": "in_flight",
-                "#lease_until": "lease_until",
-                "#updated_at": "updated_at",
-                "#last_error": "last_error",
-            },
-            ExpressionAttributeValues=eav,
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(f"[{STREAM_NAME}] DDB conditional failed (PROGRESS). Likely duplicate/out-of-order. job={job_start_id}")
-            _release_lease(job_start_id)
-            return
-        raise
-
-
-def _ddb_record_error(job_start_id: str, err: str) -> None:
-    now = int(time.time())
-    TABLE.update_item(
-        Key={"job_start_id": job_start_id},
-        UpdateExpression="SET #last_error = :e, #in_flight = :false, #lease_until = :zero, #updated_at = :now",
-        ExpressionAttributeNames={
-            "#last_error": "last_error",
-            "#in_flight": "in_flight",
-            "#lease_until": "lease_until",
-            "#updated_at": "updated_at",
-        },
-        ExpressionAttributeValues={
-            ":e": err[:2000],
-            ":false": False,
-            ":zero": 0,
-            ":now": now,
-        },
-    )
-
-
-def _parse_record(rec: Dict[str, Any]) -> Dict[str, Any]:
-    body = rec.get("body", "{}")
-    return json.loads(body) if isinstance(body, str) else body
-
-
-def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    records = event.get("Records", [])
-    logger.info(f"[{STREAM_NAME}] received_records={len(records)}")
-
-    results: List[Dict[str, Any]] = []
-
-    for rec in records:
-        job = _parse_record(rec)
-        job_start_id = job["job_start_id"]
-
-        # Expected state from the SQS message (used for conditional updates)
-        msg_cursor: Optional[str] = job.get("cursor")
-        msg_page: int = int(job.get("page", 1))
-
-        # Local loop vars (mutable)
-        cursor = msg_cursor
-        page = msg_page
-
+        processed = 0
         session = make_session()
-        pages_written = 0
 
+        while processed < PAGES_PER_INVOCATION and _time_left_ok(context):
+            # 2. Fetch Params (Cursor Only - No 'page' or 'order_by' for messages)
+            params = {"limit": PAGE_SIZE}
+            if cursor: params["cursor"] = cursor
+
+            payload, headers = safe_get(session, ENDPOINT, params)
+            
+            # Robust parsing for list
+            items = []
+            if isinstance(payload, dict):
+                for k in ["data", "items", "results", STREAM_NAME]:
+                    if k in payload and isinstance(payload[k], list):
+                        items = payload[k]; break
+            
+            if not items:
+                _ddb_done(job_start_id, "no items")
+                return {"ok": True, "done": True}
+                
+            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
+            processed += 1
+            
+            # 3. Stop Conditions
+            meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+            next_cursor = meta.get("next_cursor") or meta.get("nextCursor")
+
+            if not next_cursor:
+                _ddb_done(job_start_id, "completed")
+                return {"ok": True, "done": True}
+                
+            cursor = next_cursor
+            page += 1
+
+        _ddb_update_running(job_start_id, page, cursor, f"processed {processed}")
+        return {"ok": True, "done": False}
+
+    except Exception as e:
+        logger.exception(f"[{STREAM_NAME}] error")
         try:
-            while pages_written < PAGES_PER_INVOCATION and time_budget_ok(context):
-                params: Dict[str, Any] = {
-                    "limit": PAGE_SIZE,
-                    "order_by": f"{ORDER_BY_FIELD}:{job.get('direction', DIRECTION_DEFAULT)}",
-                }
-                if cursor:
-                    params["cursor"] = cursor
-
-                payload = safe_get(session, ENDPOINT, params=params)
-                items = payload.get("data", []) or []
-                api_next_cursor = (payload.get("meta") or {}).get("next_cursor")
-
-                if not items:
-                    logger.info(f"[{STREAM_NAME}] empty page -> DONE job={job_start_id} page={page}")
-                    _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
-                    break
-
-                s3_key = f"{S3_PREFIX_BASE}/{STREAM_NAME}/job={job_start_id}/page={page:06d}.json"
-                s3_put_json(s3_key, payload)
-
-                logger.info(
-                    f"[{STREAM_NAME}] WROTE job={job_start_id} page={page} items={len(items)} "
-                    f"next_cursor_present={bool(api_next_cursor)} s3_key={s3_key}"
-                )
-
-                pages_written += 1
-
-                if not api_next_cursor:
-                    logger.info(f"[{STREAM_NAME}] no next_cursor -> DONE job={job_start_id} last_page={page}")
-                    _ddb_mark_done(job_start_id, expected_cursor=msg_cursor, expected_page=msg_page)
-                    break
-
-                # Update DDB using the expected msg_* values
-                _ddb_update_progress(
-                    job_start_id=job_start_id,
-                    expected_cursor=msg_cursor,
-                    expected_page=msg_page,
-                    next_cursor=api_next_cursor,
-                    next_page=page + 1,
-                )
-
-                # After successful state update, expected state becomes the new state
-                msg_cursor = api_next_cursor
-                msg_page = page + 1
-
-                # Advance local vars
-                cursor = api_next_cursor
-                page = page + 1
-
-                if SLEEP_BETWEEN_REQUESTS_SEC > 0:
-                    time.sleep(SLEEP_BETWEEN_REQUESTS_SEC)
-
-        except Exception as e:
-            logger.exception(f"[{STREAM_NAME}] ERROR job={job_start_id}")
-            _ddb_record_error(job_start_id, str(e))
-            raise
-        finally:
-            # Safety: if we never wrote a page (so no progress/done update released the lease),
-            # release it so orchestrator can retry quickly.
-            if pages_written == 0:
-                _release_lease(job_start_id)
-
-        results.append({"job_start_id": job_start_id, "pages_written": pages_written})
-
-    return {"results": results}
+            if 'job_start_id' in locals(): _ddb_error(job_start_id, str(e))
+        except: pass
+        raise
+    finally:
+        # Safety: if we never wrote a page (so no progress/done update released the lease),
+        # release it so orchestrator can retry quickly.
+        if 'processed' in locals() and processed == 0 and 'job_start_id' in locals():
+            _release_lease(job_start_id)

@@ -349,7 +349,7 @@ def make_gorgias_orchestrated_stream(
                 "S3_BUCKET": GORGIAS_BUCKET_NAME,
                 "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
                 "PAGE_SIZE": "100",
-                "PAGES_PER_INVOCATION": "5",
+                "PAGES_PER_INVOCATION": "100",  # Increased to 100 as requested for faster backfills
                 "FILTER_TO_CUTOFF": "false",
                 "STREAM_NAME": name,
             }
@@ -465,7 +465,7 @@ gorgias_messages_fifo_q, gorgias_messages_fifo_fn = make_gorgias_stream(
 )
 
 # -------------------------
-# Customers: NON-RECURSIVE pipeline (UNCHANGED)
+# Customers: DAILY pipeline (UPDATED)
 # -------------------------
 gorgias_orchestrator_rule = aws.cloudwatch.EventRule(
     "gorgias-orchestrator-every-minute",
@@ -551,7 +551,7 @@ gorgias_customers_fn = aws.lambda_.Function(
             "S3_BUCKET": GORGIAS_BUCKET_NAME,
             "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
             "PAGE_SIZE": "100",
-            "PAGES_PER_INVOCATION": "10",
+            "PAGES_PER_INVOCATION": "100", # Increased for efficiency
         }
     ),
 )
@@ -626,6 +626,8 @@ gorgias_orchestrator_fn = aws.lambda_.Function(
             "VISIBILITY_TIMEOUT_SEC": "900",
             "LEASE_BUFFER_SEC": "60",
             "ORCHESTRATOR_RULE_NAME": gorgias_orchestrator_rule.name,
+            # NEW: Explicit Start Hour for visibility
+            "DAILY_START_HOUR": "2",
         }
     ),
 )
@@ -635,7 +637,8 @@ aws.cloudwatch.EventTarget(
     "gorgias-orchestrator-target",
     rule=gorgias_orchestrator_rule.name,
     arn=gorgias_orchestrator_fn.arn,
-    input='{"job_start_id":"gorgias_customers_backfill"}',
+    # UPDATED: Use 'daily' ID to trigger the new logic
+    input='{"job_start_id":"gorgias_customers_daily"}',
 )
 
 aws.lambda_.Permission(
