@@ -95,8 +95,9 @@ def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[
     dt = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = (
         f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/"
-        f"page={page:06d}-{int(time.time())}-{uuid.uuid4().hex}.json"
+        f"page={page:06d}.json"
     )
+
     body = "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records)
     _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")

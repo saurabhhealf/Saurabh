@@ -3,6 +3,5 @@
   "status": {"S": "RUNNING"},
   "in_flight": {"BOOL": false},
   "lease_until": {"N": "0"},
-  "page": {"N": "1"},
-  "cursor": {"S": ""}
+  "page": {"N": "1"}
 }
