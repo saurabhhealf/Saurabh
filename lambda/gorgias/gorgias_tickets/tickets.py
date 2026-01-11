@@ -51,22 +51,23 @@ def _safe_json_loads(s: str) -> Any:
 
 
 def _get_secret_value(secret_id: str) -> str:
-    """
-    Returns a usable string from Secrets Manager.
-    Supports secrets stored as plain string OR JSON blob.
-    """
     resp = _sm.get_secret_value(SecretId=secret_id)
-    secret = resp.get("SecretString") or ""
-    secret = secret.strip()
+    secret = (resp.get("SecretString") or "").strip()
 
     parsed = _safe_json_loads(secret)
     if isinstance(parsed, dict):
-        # Common patterns across teams
-        for k in ["value", "secret", "token", "api_key", "apiKey", "key", "password", "email", "username"]:
-            if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
-                return parsed[k].strip()
+        for k in [
+            "GORGIAS_EMAIL", "GORGIAS_API_KEY",
+            "email", "username",
+            "api_key", "apiKey", "key", "token", "secret", "value",
+            "password",
+        ]:
+            v = parsed.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip().strip('"').strip("'")
 
-    return secret
+    return secret.strip().strip('"').strip("'")
+
 
 
 def _gorgias_auth() -> Tuple[str, str]:
@@ -240,9 +241,6 @@ def _parse_next_cursor(resp_json: Any) -> Optional[str]:
 
 
 def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    ASC from the beginning. No cutoff. No desc.
-    """
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
 
@@ -250,7 +248,6 @@ def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]],
         "limit": PAGE_SIZE,
         "per_page": PAGE_SIZE,
         "page": page,
-        # enforce ASC ordering (oldest -> newest)
         "order_by": "created_datetime",
         "order_direction": "asc",
         "sort": "created_datetime",
@@ -259,13 +256,34 @@ def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]],
     if cursor:
         params["cursor"] = cursor
 
+    # --- Attempt 1: Basic Auth (email, api_key) ---
     r = requests.get(url, params=params, auth=(email, api_key), timeout=60)
-    r.raise_for_status()
-    j = r.json()
 
+    # If unauthorized, try Bearer token fallback
+    if r.status_code == 401:
+        logger.warning(
+            f"[{STREAM_NAME}] 401 with BasicAuth. Retrying with Bearer. "
+            f"base_url={GORGIAS_BASE_URL} endpoint={ENDPOINT} email_secret={GORGIAS_EMAIL_SECRET} api_key_secret={GORGIAS_API_KEY_SECRET}"
+        )
+        headers = {"Authorization": f"Bearer {api_key}"}
+        r = requests.get(url, params=params, headers=headers, timeout=60)
+
+    # If still not OK, raise with more context
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        # Log response body (usually short JSON error) but avoid dumping secrets
+        body_preview = (r.text or "")[:500]
+        logger.error(
+            f"[{STREAM_NAME}] HTTP {r.status_code} calling {r.url} "
+            f"email_secret={GORGIAS_EMAIL_SECRET} api_key_secret={GORGIAS_API_KEY_SECRET} "
+            f"resp_preview={body_preview}"
+        )
+        raise
+
+    j = r.json()
     items = _parse_response_items(j)
     next_cursor = _parse_next_cursor(j)
-
     return items, next_cursor
 
 
