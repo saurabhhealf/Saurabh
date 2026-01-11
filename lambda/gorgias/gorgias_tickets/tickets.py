@@ -244,47 +244,47 @@ def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]],
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
 
+    # Tickets endpoint tends to be picky about sorting params.
+    # Use the compact style that worked previously: order_by=field:direction
     params: Dict[str, Any] = {
         "limit": PAGE_SIZE,
-        "per_page": PAGE_SIZE,
         "page": page,
-        "order_by": "created_datetime",
-        "order_direction": "asc",
-        "sort": "created_datetime",
-        "direction": "asc",
+        "order_by": "created_datetime:asc",
     }
     if cursor:
         params["cursor"] = cursor
 
-    # --- Attempt 1: Basic Auth (email, api_key) ---
-    r = requests.get(url, params=params, auth=(email, api_key), timeout=60)
+    def _do_request(headers: Optional[Dict[str, str]] = None, use_basic_auth: bool = True) -> requests.Response:
+        return requests.get(
+            url,
+            params=params,
+            auth=(email, api_key) if use_basic_auth else None,
+            headers=headers,
+            timeout=60,
+        )
 
-    # If unauthorized, try Bearer token fallback
+    # Attempt 1: Basic Auth
+    r = _do_request(use_basic_auth=True)
+
+    # Attempt 2: Bearer token fallback if BasicAuth gets 401
     if r.status_code == 401:
         logger.warning(
             f"[{STREAM_NAME}] 401 with BasicAuth. Retrying with Bearer. "
-            f"base_url={GORGIAS_BASE_URL} endpoint={ENDPOINT} email_secret={GORGIAS_EMAIL_SECRET} api_key_secret={GORGIAS_API_KEY_SECRET}"
+            f"base_url={GORGIAS_BASE_URL} endpoint={ENDPOINT} "
+            f"email_secret={GORGIAS_EMAIL_SECRET} api_key_secret={GORGIAS_API_KEY_SECRET}"
         )
-        headers = {"Authorization": f"Bearer {api_key}"}
-        r = requests.get(url, params=params, headers=headers, timeout=60)
+        r = _do_request(headers={"Authorization": f"Bearer {api_key}"}, use_basic_auth=False)
 
-    # If still not OK, raise with more context
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        # Log response body (usually short JSON error) but avoid dumping secrets
-        body_preview = (r.text or "")[:500]
-        logger.error(
-            f"[{STREAM_NAME}] HTTP {r.status_code} calling {r.url} "
-            f"email_secret={GORGIAS_EMAIL_SECRET} api_key_secret={GORGIAS_API_KEY_SECRET} "
-            f"resp_preview={body_preview}"
-        )
-        raise
+    # If still not OK, raise with context (include response body preview)
+    if r.status_code >= 400:
+        body_preview = (r.text or "")[:1000]
+        logger.error(f"[{STREAM_NAME}] HTTP {r.status_code} url={r.url} resp_preview={body_preview}")
+
+    r.raise_for_status()
 
     j = r.json()
-    items = _parse_response_items(j)
-    next_cursor = _parse_next_cursor(j)
-    return items, next_cursor
+    return _parse_response_items(j), _parse_next_cursor(j)
+
 
 
 # ---------- Lambda handler ----------
