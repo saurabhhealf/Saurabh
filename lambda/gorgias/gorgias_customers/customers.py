@@ -32,7 +32,7 @@ DIRECTION_DEFAULT = "asc"
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 REQUEST_TIMEOUT = (10, 60)
 
-PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "5"))
+PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "60"))
 SLEEP_BETWEEN_REQUESTS_SEC = float(os.environ.get("SLEEP_BETWEEN_REQUESTS_SEC", "0.0"))
 
 # Secrets Manager
