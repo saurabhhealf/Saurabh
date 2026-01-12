@@ -637,8 +637,8 @@ aws.cloudwatch.EventTarget(
     "gorgias-orchestrator-target",
     rule=gorgias_orchestrator_rule.name,
     arn=gorgias_orchestrator_fn.arn,
-    # UPDATED: Use 'daily' ID to trigger the new logic
-    input='{"job_start_id":"gorgias_customers_daily"}',
+    # This MUST contain the word "daily"
+    input='{"job_start_id":"gorgias_customers_daily"}', 
 )
 
 aws.lambda_.Permission(
