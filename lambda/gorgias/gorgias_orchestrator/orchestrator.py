@@ -1,9 +1,9 @@
-import json
 import os
+import json
 import time
 import logging
-
 import boto3
+from datetime import datetime, timedelta, timezone
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -15,121 +15,132 @@ _events = boto3.client("events")
 
 STATE_TABLE = os.environ["STATE_TABLE"]
 QUEUE_URL = os.environ["BACKFILL_QUEUE_URL"]
-
-# NEW: rule name to disable on DONE
-ORCHESTRATOR_RULE_NAME = os.environ.get("ORCHESTRATOR_RULE_NAME", "").strip()
-
-VISIBILITY_TIMEOUT_SEC = int(os.environ.get("VISIBILITY_TIMEOUT_SEC", "300"))
-LEASE_BUFFER_SEC = int(os.environ.get("LEASE_BUFFER_SEC", "60"))
-
 TABLE = _ddb.Table(STATE_TABLE)
 
+# Configurable start hour (02:00 UTC) for daily jobs
+DAILY_START_HOUR = 2
 
-def _disable_schedule_rule_if_configured(reason: str) -> None:
-    if not ORCHESTRATOR_RULE_NAME:
-        logger.warning(f"[orchestrator] ORCHESTRATOR_RULE_NAME not set; cannot disable schedule (reason={reason})")
-        return
+def _disable_schedule_rule_if_configured(rule_name: str, reason: str) -> None:
+    """Disables the EventBridge rule (Used only for backfill jobs)."""
+    if not rule_name: return
     try:
-        _events.disable_rule(Name=ORCHESTRATOR_RULE_NAME)
-        logger.info(f"[orchestrator] Disabled schedule rule '{ORCHESTRATOR_RULE_NAME}' (reason={reason})")
+        _events.disable_rule(Name=rule_name)
+        logger.info(f"[orchestrator] Disabled schedule rule '{rule_name}' (reason={reason})")
     except ClientError as e:
-        code = e.response["Error"]["Code"]
-        # If it's already disabled or some race, just log it
-        logger.warning(f"[orchestrator] Failed to disable rule '{ORCHESTRATOR_RULE_NAME}': {code} {e}")
-
+        logger.warning(f"[orchestrator] Failed to disable rule '{rule_name}': {e}")
 
 def handler(event, context):
-    # Scheduler passes constant JSON input like {"job_start_id":"gorgias_customers_backfill"}
-    job_start_id = (event or {}).get("job_start_id")
-    if not job_start_id:
-        raise ValueError("Missing job_start_id in event input")
+    job_start_id = event.get("job_start_id")
+    if not job_start_id: raise ValueError("Missing job_start_id in event input")
+
+    # Determine Mode: "Daily" vs "Backfill" based on job ID string
+    IS_DAILY = "daily" in job_start_id
+    ORCHESTRATOR_RULE_NAME = os.environ.get("ORCHESTRATOR_RULE_NAME", "").strip()
 
     now = int(time.time())
-    item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
-    if not item:
-        logger.warning(f"[orchestrator] state missing job={job_start_id}")
-        _disable_schedule_rule_if_configured(reason="missing_state")
-        return {"enqueued": False, "reason": "missing_state", "disabled_rule": bool(ORCHESTRATOR_RULE_NAME)}
+    now_dt = datetime.now(timezone.utc)
 
+    # ==========================================
+    # 1. DAILY JOB LOGIC (Customers)
+    # ==========================================
+    if IS_DAILY:
+        # Calculate Target Date (Yesterday)
+        if now_dt.hour >= DAILY_START_HOUR:
+            target_date = (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            # Before 2 AM, target day-before-yesterday (likely already done)
+            target_date = (now_dt - timedelta(days=2)).strftime("%Y-%m-%d")
 
+        item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
+        
+        # Seed state if missing
+        if not item:
+            logger.info(f"[orchestrator] Seeding new daily job {job_start_id} for {target_date}")
+            TABLE.put_item(Item={
+                "job_start_id": job_start_id, "status": "RUNNING", "page": 1,
+                "in_flight": False, "lease_until": 0, "run_date": target_date
+            })
+            item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
+
+        # CHECK FOR NEW DAY -> RESET STATE
+        stored_run_date = item.get("run_date", "")
+        if stored_run_date != target_date:
+            logger.info(f"[orchestrator] New day detected! Resetting {job_start_id} for {target_date}")
+            TABLE.update_item(
+                Key={"job_start_id": job_start_id},
+                UpdateExpression="SET #status=:r, #page=:p, #run_date=:rd, #lease_until=:z REMOVE #cursor",
+                ExpressionAttributeNames={"#status": "status", "#page": "page", "#run_date": "run_date", "#lease_until": "lease_until"},
+                ExpressionAttributeValues={":r": "RUNNING", ":p": 1, ":rd": target_date, ":z": 0}
+            )
+            # Re-fetch updated item to proceed immediately
+            item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
+
+        # If already DONE for today, just sleep (do NOT disable rule)
+        if item.get("status") == "DONE":
+            return {"enqueued": False, "reason": "done_for_day", "run_date": target_date}
+
+    # ==========================================
+    # 2. BACKFILL JOB LOGIC (Tickets, Messages)
+    # ==========================================
+    else:
+        item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
+        if not item:
+            logger.warning(f"[orchestrator] state missing job={job_start_id}")
+            _disable_schedule_rule_if_configured(ORCHESTRATOR_RULE_NAME, "missing_state")
+            return {"enqueued": False, "reason": "missing_state"}
+
+        status = item.get("status")
+        if status in ["DONE", "ERROR"]:
+            _disable_schedule_rule_if_configured(ORCHESTRATOR_RULE_NAME, f"status_{status}")
+            return {"enqueued": False, "reason": f"status={status}"}
+
+    # ==========================================
+    # 3. COMMON LOGIC (Lease & Enqueue)
+    # ==========================================
     status = item.get("status")
-    in_flight = bool(item.get("in_flight", False))
-    lease_until = int(item.get("lease_until", 0))
-    page = int(item.get("page", 1))
-    cursor = item.get("cursor")  # may be missing/None
-
-    logger.info(
-        f"[orchestrator] job={job_start_id} status={status} in_flight={in_flight} "
-        f"lease_until={lease_until} page={page}"
-    )
-
-    # ✅ Auto-stop schedule when DONE (or any terminal state you choose)
-    if status == "DONE":
-        _disable_schedule_rule_if_configured(reason="job_done")
-        return {"enqueued": False, "reason": "status=DONE", "disabled_rule": bool(ORCHESTRATOR_RULE_NAME)}
-
-    # You can decide whether ERROR should also stop the schedule:
-    if status == "ERROR":
-        _disable_schedule_rule_if_configured(reason="job_error")
-        return {"enqueued": False, "reason": "status=ERROR", "disabled_rule": bool(ORCHESTRATOR_RULE_NAME)}
-
     if status != "RUNNING":
         return {"enqueued": False, "reason": f"status={status}"}
+
+    in_flight = bool(item.get("in_flight", False))
+    lease_until = int(item.get("lease_until", 0))
 
     if in_flight and lease_until > now:
         return {"enqueued": False, "reason": "lease_active"}
 
-    # Acquire lease (prevents double-enqueue if scheduler overlaps / retries)
-    new_lease = now + VISIBILITY_TIMEOUT_SEC + LEASE_BUFFER_SEC
+    # Acquire Lease (15 min)
+    new_lease = now + 900
     try:
         TABLE.update_item(
             Key={"job_start_id": job_start_id},
-            ConditionExpression=(
-                "#status = :running AND "
-                "(attribute_not_exists(#in_flight) OR #in_flight = :false OR #lease_until < :now)"
-            ),
+            ConditionExpression="attribute_not_exists(#in_flight) OR #in_flight = :false OR #lease_until < :now",
             UpdateExpression="SET #in_flight = :true, #lease_until = :lease, #updated_at = :now",
-            ExpressionAttributeNames={
-                "#status": "status",
-                "#in_flight": "in_flight",
-                "#lease_until": "lease_until",
-                "#updated_at": "updated_at",
-            },
-            ExpressionAttributeValues={
-                ":running": "RUNNING",
-                ":false": False,
-                ":true": True,
-                ":now": now,
-                ":lease": new_lease,
-            },
+            ExpressionAttributeNames={"#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at"},
+            ExpressionAttributeValues={":false": False, ":true": True, ":now": now, ":lease": new_lease}
         )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.info("[orchestrator] lease not acquired (someone else owns it)")
-            return {"enqueued": False, "reason": "lease_not_acquired"}
-        raise
+    except ClientError:
+        logger.info("[orchestrator] lease not acquired")
+        return {"enqueued": False, "reason": "lease_not_acquired"}
 
-    # Send exactly one message
+    # Prepare Message
+    page = int(item.get("page", 1))
+    cursor = item.get("cursor")
+    
     body = {"job_start_id": job_start_id, "page": page}
-    if cursor:
-        body["cursor"] = cursor
+    if cursor: body["cursor"] = cursor
+    
+    # Pass target_date to daily workers so they know what to filter
+    if IS_DAILY: body["target_date"] = item.get("run_date")
 
     try:
         _sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(body))
-        logger.info(f"[orchestrator] ENQUEUED job={job_start_id} page={page} cursor_present={bool(cursor)}")
+        logger.info(f"[orchestrator] ENQUEUED job={job_start_id} page={page}")
         return {"enqueued": True, "job_start_id": job_start_id, "page": page}
     except Exception as e:
-        # Release lease if enqueue fails
+        # Release lease on error
         TABLE.update_item(
             Key={"job_start_id": job_start_id},
-            UpdateExpression="SET #in_flight = :false, #lease_until = :zero, #updated_at = :now, #last_error = :e",
-            ExpressionAttributeNames={
-                "#in_flight": "in_flight",
-                "#lease_until": "lease_until",
-                "#updated_at": "updated_at",
-                "#last_error": "last_error",
-            },
-            ExpressionAttributeValues={":false": False, ":zero": 0, ":now": now, ":e": str(e)[:2000]},
+            UpdateExpression="SET #in_flight = :false, #lease_until = :zero",
+            ExpressionAttributeNames={"#in_flight": "in_flight", "#lease_until": "lease_until"},
+            ExpressionAttributeValues={":false": False, ":zero": 0}
         )
         raise
-

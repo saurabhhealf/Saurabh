@@ -1,8 +1,1 @@
-{
-  "job_start_id": {"S": "gorgias_messages_backfill"},
-  "status": {"S": "RUNNING"},
-  "in_flight": {"BOOL": false},
-  "lease_until": {"N": "0"},
-  "page": {"N": "1"},
-  "cursor": {"S": ""}
-}
+{"job_start_id": {"S": "gorgias_customers_daily"}, "status": {"S": "RUNNING"}, "page": {"N": "1"}, "in_flight": {"BOOL": false}, "lease_until": {"N": "0"}, "run_date": {"S": "2025-01-13"}}
