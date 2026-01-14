@@ -1,14 +1,16 @@
 """
 messages.py — Gorgias /messages backfill extractor → S3 JSONL
-Key goals:
-- Never "crash-loop" on HTTP 429 (rate limit): backoff + checkpoint + graceful exit
-- Avoid accidental parallelism: DDB lease lock (even if Lambda/SQS concurrency misconfigured)
-- Predictable progress: checkpoint cursor/page frequently
+
+Goals:
+- No crash-loop on HTTP 429: backoff + checkpoint + graceful exit
+- Prevent parallelism: DDB lease lock (even if Lambda/SQS concurrency misconfigured)
+- Predictable resume: checkpoint cursor/page frequently
 - Gentle throttling on success using X-Gorgias-Account-Api-Call-Limit when present
 
-IMPORTANT (infra):
-- Still set Lambda reserved concurrency = 1 and SQS batch size = 1 + visibility timeout > max runtime.
-  This code ALSO protects you via a DDB lease, but infra should be correct too.
+Infra still recommended:
+- Lambda reserved concurrency = 1
+- SQS batch size = 1
+- Visibility timeout > max runtime
 """
 
 import os
@@ -42,7 +44,7 @@ ENDPOINT = "/messages"
 
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 
-# How many pages *max* to attempt per invocation. Keep this moderate to reduce burstiness.
+# How many pages max per invocation (keep moderate to reduce burstiness)
 PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "20"))
 
 # Rate limit + retries
@@ -95,7 +97,6 @@ def _get_secret_value(secret_id: str) -> str:
     parsed = _safe_json_loads(secret)
 
     if isinstance(parsed, dict):
-        # common key patterns
         for k in [
             "GORGIAS_EMAIL",
             "GORGIAS_API_KEY",
@@ -149,22 +150,16 @@ def _parse_limit_header(headers: Dict[str, str]) -> Optional[Tuple[int, int]]:
 
 def _throttle_on_success(headers: Dict[str, str]) -> None:
     parsed = _parse_limit_header(headers)
-    if not parsed:
-        # still apply a tiny smoothing delay if configured
-        if MIN_SUCCESS_DELAY_SECONDS > 0:
-            time.sleep(MIN_SUCCESS_DELAY_SECONDS)
-        return
 
-    used, limit = parsed
-    ratio = used / limit
+    # always smooth a bit if configured
+    sleep_s = MIN_SUCCESS_DELAY_SECONDS if MIN_SUCCESS_DELAY_SECONDS > 0 else 0.0
 
-    # always smooth a bit, then ramp more if ratio is high
-    sleep_s = MIN_SUCCESS_DELAY_SECONDS
-
-    if ratio >= THROTTLE_RATIO:
-        # ramp: at THROTTLE_RATIO sleep ~0.2–0.4, near 1.0 sleep up to THROTTLE_MAX_SLEEP_SECONDS
-        ramp = (ratio - THROTTLE_RATIO) / max(1e-9, (1.0 - THROTTLE_RATIO))
-        sleep_s = max(sleep_s, min(THROTTLE_MAX_SLEEP_SECONDS, 0.2 + ramp * THROTTLE_MAX_SLEEP_SECONDS))
+    if parsed:
+        used, limit = parsed
+        ratio = used / limit
+        if ratio >= THROTTLE_RATIO:
+            ramp = (ratio - THROTTLE_RATIO) / max(1e-9, (1.0 - THROTTLE_RATIO))
+            sleep_s = max(sleep_s, min(THROTTLE_MAX_SLEEP_SECONDS, 0.2 + ramp * THROTTLE_MAX_SLEEP_SECONDS))
 
     if sleep_s > 0:
         time.sleep(sleep_s)
@@ -220,17 +215,23 @@ def _ddb_acquire_lease(job_start_id: str, request_id: str) -> bool:
 def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
     now = _utc_now_ts()
     lease_until = now + LEASE_SECONDS
-    TABLE.update_item(
-        Key={"job_start_id": job_start_id},
-        UpdateExpression="SET lease_until=:lu, updated_at=:now",
-        ConditionExpression="lease_owner = :lo",
-        ExpressionAttributeValues={":lu": lease_until, ":now": now, ":lo": request_id},
-    )
+    try:
+        TABLE.update_item(
+            Key={"job_start_id": job_start_id},
+            UpdateExpression="SET lease_until=:lu, updated_at=:now",
+            ConditionExpression="lease_owner = :lo",
+            ExpressionAttributeValues={":lu": lease_until, ":now": now, ":lo": request_id},
+        )
+    except ClientError as e:
+        # Don't kill the run if ownership changed (shouldn't happen, but avoid crash-loop)
+        if e.response["Error"].get("Code") == "ConditionalCheckFailedException":
+            logger.warning(f"[{STREAM_NAME}] lease renew skipped (not owner). job_start_id={job_start_id}")
+            return
+        raise
 
 
 def _ddb_checkpoint(
     job_start_id: str,
-    request_id: str,
     status: str,
     page: int,
     cursor: Optional[str],
@@ -260,28 +261,21 @@ def _ddb_checkpoint(
         expr += ", #last_error=:e"
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
-    else:
-        # optional: clear previous error on success
-        expr += " REMOVE #last_error"
-        names["#last_error"] = "last_error"
 
-    # Keep lease_owner/lease_until as-is; do not wipe it here.
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
         UpdateExpression=expr,
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=vals,
-        ConditionExpression="lease_owner = :lo",
-        ExpressionAttributeValues={**vals, ":lo": request_id},
     )
 
 
-def _ddb_done(job_start_id: str, request_id: str, note: str = "") -> None:
-    _ddb_checkpoint(job_start_id, request_id, "DONE", page=0, cursor=None, note=note, last_error="")
+def _ddb_done(job_start_id: str, note: str = "") -> None:
+    _ddb_checkpoint(job_start_id, "DONE", page=0, cursor=None, note=note, last_error="")
 
 
-def _ddb_error(job_start_id: str, request_id: str, page: int, cursor: Optional[str], err: str) -> None:
-    _ddb_checkpoint(job_start_id, request_id, "ERROR", page=page, cursor=cursor, note="error", last_error=err)
+def _ddb_error(job_start_id: str, page: int, cursor: Optional[str], err: str) -> None:
+    _ddb_checkpoint(job_start_id, "ERROR", page=page, cursor=cursor, note="error", last_error=err)
 
 
 # -------------------- API fetcher w/ rate-limit handling --------------------
@@ -296,8 +290,11 @@ def _request_with_backoff(
 ) -> requests.Response:
     backoff = BACKOFF_BASE_SECONDS
 
+    last_resp: Optional[requests.Response] = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         r = session.request(method, url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
+        last_resp = r
 
         # Bearer fallback on 401
         if r.status_code == 401:
@@ -308,6 +305,7 @@ def _request_with_backoff(
                 headers={"Authorization": f"Bearer {bearer_key}"},
                 timeout=REQUEST_TIMEOUT,
             )
+            last_resp = r
 
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
@@ -327,7 +325,6 @@ def _request_with_backoff(
             continue
 
         if r.status_code >= 500:
-            # transient server error — retry with backoff
             sleep_s = backoff + random.random()
             backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
             logger.warning(
@@ -338,8 +335,9 @@ def _request_with_backoff(
 
         return r
 
-    # If we got here, repeated 429/5xx; return last response-like error
-    raise RuntimeError(f"Exceeded max retries for {url} (likely repeated 429/5xx)")
+    # ran out of retries
+    code = last_resp.status_code if last_resp is not None else "n/a"
+    raise RuntimeError(f"Exceeded max retries for {url} (last_status={code})")
 
 
 def _fetch_page(session: requests.Session, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str], Dict[str, str]]:
@@ -353,7 +351,6 @@ def _fetch_page(session: requests.Session, cursor: Optional[str]) -> Tuple[List[
     r = _request_with_backoff(session, "GET", url, params=params, auth=(email, api_key), bearer_key=api_key)
 
     if r.status_code >= 400:
-        # log body snippet but don't dump huge
         logger.error(f"[{STREAM_NAME}] HTTP {r.status_code} url={r.url} body={r.text[:500]}")
         r.raise_for_status()
 
@@ -383,7 +380,8 @@ def handler(event, context):
 
     # Parse SQS body (or direct invoke)
     record = (event.get("Records") or [None])[0] if isinstance(event, dict) else None
-    body = {}
+    body: Dict[str, Any] = {}
+
     if record and isinstance(record, dict) and record.get("body"):
         try:
             body = json.loads(record["body"])
@@ -392,7 +390,7 @@ def handler(event, context):
     elif isinstance(event, dict):
         body = event
 
-    job_start_id = (body or {}).get("job_start_id")
+    job_start_id = body.get("job_start_id")
     if not job_start_id:
         raise ValueError("Missing job_start_id")
 
@@ -404,27 +402,24 @@ def handler(event, context):
     if state.get("status") != "RUNNING":
         return {"ok": True, "skipped": True, "status": state.get("status")}
 
-    # Acquire lease (prevents parallel invocations even if infra misconfigured)
+    # Acquire lease
     if not _ddb_acquire_lease(job_start_id, request_id):
         logger.info(f"[{STREAM_NAME}] lease not acquired (another invocation running). job_start_id={job_start_id}")
         return {"ok": True, "skipped": True, "reason": "lease_busy"}
 
-    # Read checkpointed cursor/page
-    # Page is only for S3 file naming; cursor is the real pagination key.
-    cursor = (body.get("cursor") if isinstance(body, dict) else None) or state.get("cursor")
+    # Resume from DDB checkpoint unless overridden
+    cursor = body.get("cursor") or state.get("cursor")
     if cursor == "":
         cursor = None
-
-    page = int((body.get("page") if isinstance(body, dict) else None) or state.get("page") or 1)
+    page = int(body.get("page") or state.get("page") or 1)
 
     processed = 0
-    last_limit_hdr = None
+    last_limit_hdr: Optional[str] = None
 
     session = requests.Session()
 
     try:
         while processed < PAGES_PER_INVOCATION and _time_left_ok(context):
-            # renew lease periodically
             if processed > 0 and processed % LEASE_RENEW_EVERY_PAGES == 0:
                 _ddb_renew_lease(job_start_id, request_id)
 
@@ -435,14 +430,11 @@ def handler(event, context):
                     last_limit_hdr = f"{lim[0]}/{lim[1]}"
 
             except RuntimeError as e:
-                # This is our "exceeded retries" condition (likely repeated 429/5xx).
-                # DO NOT raise → checkpoint and exit gracefully to avoid SQS retry storms.
                 msg = str(e)
                 logger.warning(f"[{STREAM_NAME}] stopping early due to transient failures: {msg}")
 
                 _ddb_checkpoint(
                     job_start_id=job_start_id,
-                    request_id=request_id,
                     status="RUNNING",
                     page=page,
                     cursor=cursor,
@@ -452,41 +444,22 @@ def handler(event, context):
                 return {"ok": True, "done": False, "paused": True, "processed": processed}
 
             if not items:
-                _ddb_checkpoint(
-                    job_start_id=job_start_id,
-                    request_id=request_id,
-                    status="DONE",
-                    page=0,
-                    cursor=None,
-                    note="no items",
-                    last_error="",
-                )
+                _ddb_done(job_start_id, note="no items")
                 return {"ok": True, "done": True, "processed": processed}
 
             _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
-
             processed += 1
+
             cursor = next_cursor
             page += 1
 
-            # If no next cursor, we are done.
             if not cursor:
-                _ddb_checkpoint(
-                    job_start_id=job_start_id,
-                    request_id=request_id,
-                    status="DONE",
-                    page=0,
-                    cursor=None,
-                    note=f"completed (processed {processed}) limit={last_limit_hdr or 'n/a'}",
-                    last_error="",
-                )
+                _ddb_done(job_start_id, note=f"completed (processed {processed}) limit={last_limit_hdr or 'n/a'}")
                 return {"ok": True, "done": True, "processed": processed}
 
-            # checkpoint every few pages so we don't re-hit same pages on restart
             if processed % CHECKPOINT_EVERY_PAGES == 0:
                 _ddb_checkpoint(
                     job_start_id=job_start_id,
-                    request_id=request_id,
                     status="RUNNING",
                     page=page,
                     cursor=cursor,
@@ -494,10 +467,8 @@ def handler(event, context):
                     last_error="",
                 )
 
-        # Out of time or hit pages-per-invocation: checkpoint and exit cleanly
         _ddb_checkpoint(
             job_start_id=job_start_id,
-            request_id=request_id,
             status="RUNNING",
             page=page,
             cursor=cursor,
@@ -509,7 +480,7 @@ def handler(event, context):
     except Exception as e:
         logger.exception(f"[{STREAM_NAME}] fatal error")
         try:
-            _ddb_error(job_start_id, request_id, page=page, cursor=cursor, err=str(e))
+            _ddb_error(job_start_id, page=page, cursor=cursor, err=str(e))
         except Exception:
             pass
         raise
