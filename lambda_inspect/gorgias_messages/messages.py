@@ -390,14 +390,9 @@ def handler(event, context):
     elif isinstance(event, dict):
         body = event
 
-    job_start_id = (body or {}).get("job_start_id")
+    job_start_id = body.get("job_start_id")
     if not job_start_id:
-        try:
-            logger.error(f"[{STREAM_NAME}] Missing job_start_id. raw_event={json.dumps(event)[:2000]}")
-        except Exception:
-            logger.error(f"[{STREAM_NAME}] Missing job_start_id. raw_event_unserializable type={type(event)}")
-        return {"ok": False, "reason": "missing_job_start_id"}
-
+        raise ValueError("Missing job_start_id")
 
     state = _ddb_get(job_start_id)
     if not state:
