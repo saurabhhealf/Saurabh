@@ -1,198 +1,515 @@
+"""
+messages.py — Gorgias /messages backfill extractor → S3 JSONL
+Key goals:
+- Never "crash-loop" on HTTP 429 (rate limit): backoff + checkpoint + graceful exit
+- Avoid accidental parallelism: DDB lease lock (even if Lambda/SQS concurrency misconfigured)
+- Predictable progress: checkpoint cursor/page frequently
+- Gentle throttling on success using X-Gorgias-Account-Api-Call-Limit when present
+
+IMPORTANT (infra):
+- Still set Lambda reserved concurrency = 1 and SQS batch size = 1 + visibility timeout > max runtime.
+  This code ALSO protects you via a DDB lease, but infra should be correct too.
+"""
+
 import os
 import json
 import time
-import uuid
+import random
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# ---------- AWS clients ----------
+# -------------------- AWS clients --------------------
 _ddb = boto3.resource("dynamodb")
 _s3 = boto3.client("s3")
 _sm = boto3.client("secretsmanager")
 
-# ---------- Env ----------
+# -------------------- Env --------------------
 GORGIAS_BASE_URL = os.environ.get("GORGIAS_BASE_URL", "https://healf-uk.gorgias.com/api").rstrip("/")
 STATE_TABLE = os.environ["STATE_TABLE"]
 S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
 S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias").strip("/")
 
-PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
-# Increased to 100 so it runs for longer and fetches ~10k items per run
-PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "100"))
-REQUEST_TIMEOUT = (10, 60)
-
-GORGIAS_EMAIL_SECRET = os.environ.get("GORGIAS_EMAIL_SECRET", "gorgias_email")
-GORGIAS_API_KEY_SECRET = os.environ.get("GORGIAS_API_KEY_SECRET", "gorgias_api_key")
-
 STREAM_NAME = "messages"
 ENDPOINT = "/messages"
 
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
+
+# How many pages *max* to attempt per invocation. Keep this moderate to reduce burstiness.
+PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "20"))
+
+# Rate limit + retries
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
+BACKOFF_BASE_SECONDS = float(os.environ.get("BACKOFF_BASE_SECONDS", "1.0"))
+BACKOFF_MAX_SECONDS = float(os.environ.get("BACKOFF_MAX_SECONDS", "30.0"))
+
+# Gentle delay even on success (smooths spikes). Set 0 to disable.
+MIN_SUCCESS_DELAY_SECONDS = float(os.environ.get("MIN_SUCCESS_DELAY_SECONDS", "0.2"))
+
+# Start slowing down once used/limit >= this ratio (if header present)
+THROTTLE_RATIO = float(os.environ.get("THROTTLE_RATIO", "0.70"))
+THROTTLE_MAX_SLEEP_SECONDS = float(os.environ.get("THROTTLE_MAX_SLEEP_SECONDS", "2.0"))
+
+# Lambda time handling
+REQUEST_TIMEOUT = (10, 60)  # (connect, read)
+TIME_LEFT_BUFFER_MS = int(os.environ.get("TIME_LEFT_BUFFER_MS", "15000"))
+
+# Lease lock in DDB to prevent parallel invocations
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "180"))  # 3 minutes
+LEASE_RENEW_EVERY_PAGES = int(os.environ.get("LEASE_RENEW_EVERY_PAGES", "5"))
+CHECKPOINT_EVERY_PAGES = int(os.environ.get("CHECKPOINT_EVERY_PAGES", "3"))
+
+# Secrets
+GORGIAS_EMAIL_SECRET = os.environ.get("GORGIAS_EMAIL_SECRET", "gorgias_email")
+GORGIAS_API_KEY_SECRET = os.environ.get("GORGIAS_API_KEY_SECRET", "gorgias_api_key")
+
 TABLE = _ddb.Table(STATE_TABLE)
 
-# ---------- Helpers ----------
-def _utc_now_ts() -> int: return int(time.time())
+
+# -------------------- Helpers --------------------
+def _utc_now_ts() -> int:
+    return int(time.time())
+
+
+def _utc_today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def _safe_json_loads(s: str) -> Any:
-    try: return json.loads(s)
-    except: return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
 
 def _get_secret_value(secret_id: str) -> str:
     resp = _sm.get_secret_value(SecretId=secret_id)
     secret = (resp.get("SecretString") or "").strip()
     parsed = _safe_json_loads(secret)
+
     if isinstance(parsed, dict):
-        for k in ["GORGIAS_EMAIL", "GORGIAS_API_KEY", "value", "secret", "token", "api_key", "apiKey", "key", "password", "email", "username"]:
+        # common key patterns
+        for k in [
+            "GORGIAS_EMAIL",
+            "GORGIAS_API_KEY",
+            "value",
+            "secret",
+            "token",
+            "api_key",
+            "apiKey",
+            "key",
+            "password",
+            "email",
+            "username",
+        ]:
             if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
                 return parsed[k].strip().strip('"').strip("'")
+
     return secret.strip().strip('"').strip("'")
+
 
 def _gorgias_auth() -> Tuple[str, str]:
     email = _get_secret_value(GORGIAS_EMAIL_SECRET)
     api_key = _get_secret_value(GORGIAS_API_KEY_SECRET)
-    if not email or not api_key: raise ValueError("Missing Gorgias credentials")
+    if not email or not api_key:
+        raise ValueError("Missing Gorgias credentials")
     return email, api_key
 
-def _time_left_ok(context, buffer_ms: int = 12_000) -> bool:
-    if context is None: return True
-    try: return context.get_remaining_time_in_millis() > buffer_ms
-    except: return True
 
-def _maybe_adaptive_sleep(headers: Dict[str, str]) -> None:
-    # Mimics customers.py: sleeps if rate limit is high
-    limit_hdr = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
-    if not limit_hdr: return
+def _time_left_ok(context, buffer_ms: int = TIME_LEFT_BUFFER_MS) -> bool:
+    if context is None:
+        return True
     try:
-        used_s, limit_s = limit_hdr.split("/", 1)
-        if int(limit_s.strip()) > 0 and int(used_s.strip()) / int(limit_s.strip()) >= 0.9:
-            time.sleep(2.0)
-    except: pass
+        return context.get_remaining_time_in_millis() > buffer_ms
+    except Exception:
+        return True
+
+
+def _parse_limit_header(headers: Dict[str, str]) -> Optional[Tuple[int, int]]:
+    h = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
+    if not h:
+        return None
+    try:
+        used_s, limit_s = h.split("/", 1)
+        used = int(used_s.strip())
+        limit = int(limit_s.strip())
+        if limit <= 0:
+            return None
+        return used, limit
+    except Exception:
+        return None
+
+
+def _throttle_on_success(headers: Dict[str, str]) -> None:
+    parsed = _parse_limit_header(headers)
+    if not parsed:
+        # still apply a tiny smoothing delay if configured
+        if MIN_SUCCESS_DELAY_SECONDS > 0:
+            time.sleep(MIN_SUCCESS_DELAY_SECONDS)
+        return
+
+    used, limit = parsed
+    ratio = used / limit
+
+    # always smooth a bit, then ramp more if ratio is high
+    sleep_s = MIN_SUCCESS_DELAY_SECONDS
+
+    if ratio >= THROTTLE_RATIO:
+        # ramp: at THROTTLE_RATIO sleep ~0.2–0.4, near 1.0 sleep up to THROTTLE_MAX_SLEEP_SECONDS
+        ramp = (ratio - THROTTLE_RATIO) / max(1e-9, (1.0 - THROTTLE_RATIO))
+        sleep_s = max(sleep_s, min(THROTTLE_MAX_SLEEP_SECONDS, 0.2 + ramp * THROTTLE_MAX_SLEEP_SECONDS))
+
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
 
 def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]]) -> str:
-    if not records: return ""
-    dt = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # Deterministic naming (page=000001.json) to match old behavior
+    if not records:
+        return ""
+
+    dt = _utc_today_str()
     key = f"{S3_PREFIX_BASE}/{stream}/dt={dt}/job={job_start_id}/page={page:06d}.json"
     body = "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False) + "\n" for r in records)
+
     _s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body.encode("utf-8"))
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
     return key
 
-# ---------- DDB (Simple/Unconditional to fix Looping) ----------
-def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]: 
-    return TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
 
-def _ddb_update_running(job_start_id: str, next_page: int, next_cursor: Optional[str], note: str = "") -> None:
+# -------------------- DDB state / lease --------------------
+def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]:
+    resp = TABLE.get_item(Key={"job_start_id": job_start_id})
+    return resp.get("Item")
+
+
+def _ddb_acquire_lease(job_start_id: str, request_id: str) -> bool:
+    """
+    Lease model:
+      - record has lease_until (epoch seconds) and lease_owner (request_id)
+      - acquire if lease_until <= now OR already owned by this request
+    """
     now = _utc_now_ts()
-    # UNCONDITIONAL UPDATE - This forces the loop to break
-    expr = "SET #status=:running, #in_flight=:false, #lease_until=:zero, #page=:p, #updated_at=:now"
-    names = {"#status": "status", "#in_flight": "in_flight", "#lease_until": "lease_until", "#page": "page", "#updated_at": "updated_at"}
-    vals = {":running": "RUNNING", ":false": False, ":zero": 0, ":p": next_page, ":now": now}
-    
-    if next_cursor:
-        expr += ", #cursor=:c"; names["#cursor"] = "cursor"; vals[":c"] = next_cursor
+    lease_until = now + LEASE_SECONDS
+
+    try:
+        TABLE.update_item(
+            Key={"job_start_id": job_start_id},
+            UpdateExpression="SET lease_until=:lu, lease_owner=:lo, in_flight=:t, updated_at=:now",
+            ConditionExpression="attribute_not_exists(lease_until) OR lease_until <= :now OR lease_owner = :lo",
+            ExpressionAttributeValues={
+                ":lu": lease_until,
+                ":lo": request_id,
+                ":t": True,
+                ":now": now,
+            },
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"].get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
+    now = _utc_now_ts()
+    lease_until = now + LEASE_SECONDS
+    TABLE.update_item(
+        Key={"job_start_id": job_start_id},
+        UpdateExpression="SET lease_until=:lu, updated_at=:now",
+        ConditionExpression="lease_owner = :lo",
+        ExpressionAttributeValues={":lu": lease_until, ":now": now, ":lo": request_id},
+    )
+
+
+def _ddb_checkpoint(
+    job_start_id: str,
+    request_id: str,
+    status: str,
+    page: int,
+    cursor: Optional[str],
+    note: str = "",
+    last_error: str = "",
+) -> None:
+    now = _utc_now_ts()
+
+    expr = "SET #status=:s, #page=:p, #updated_at=:now, in_flight=:f"
+    names = {"#status": "status", "#page": "page", "#updated_at": "updated_at"}
+    vals: Dict[str, Any] = {":s": status, ":p": page, ":now": now, ":f": False}
+
+    if cursor:
+        expr += ", #cursor=:c"
+        names["#cursor"] = "cursor"
+        vals[":c"] = cursor
     else:
-        expr += " REMOVE #cursor"; names["#cursor"] = "cursor"
-        
-    if note: expr += ", #note=:n"; names["#note"] = "note"; vals[":n"] = note[:2000]
-    
-    TABLE.update_item(Key={"job_start_id": job_start_id}, UpdateExpression=expr, ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
+        expr += " REMOVE #cursor"
+        names["#cursor"] = "cursor"
 
-def _ddb_done(job_start_id: str, note: str = "") -> None:
-    now = _utc_now_ts()
-    expr = "SET #status=:done, #in_flight=:false, #lease_until=:zero, #updated_at=:now"
-    names = {"#status": "status", "#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at"}
-    vals = {":done": "DONE", ":false": False, ":zero": 0, ":now": now}
-    if note: expr += ", #note=:n"; names["#note"] = "note"; vals[":n"] = note[:2000]
-    TABLE.update_item(Key={"job_start_id": job_start_id}, UpdateExpression=expr, ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
+    if note:
+        expr += ", #note=:n"
+        names["#note"] = "note"
+        vals[":n"] = note[:2000]
 
-def _ddb_error(job_start_id: str, err: str) -> None:
-    now = _utc_now_ts()
-    TABLE.update_item(Key={"job_start_id": job_start_id}, UpdateExpression="SET #status=:err, #in_flight=:false, #lease_until=:zero, #updated_at=:now, #last_error=:e", ExpressionAttributeNames={"#status": "status", "#in_flight": "in_flight", "#lease_until": "lease_until", "#updated_at": "updated_at", "#last_error": "last_error"}, ExpressionAttributeValues={":err": "ERROR", ":false": False, ":zero": 0, ":now": now, ":e": (err or "")[:2000]})
+    if last_error:
+        expr += ", #last_error=:e"
+        names["#last_error"] = "last_error"
+        vals[":e"] = last_error[:2000]
+    else:
+        # optional: clear previous error on success
+        expr += " REMOVE #last_error"
+        names["#last_error"] = "last_error"
 
-# ---------- API Fetcher ----------
-def _fetch_page(cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    # Keep lease_owner/lease_until as-is; do not wipe it here.
+    TABLE.update_item(
+        Key={"job_start_id": job_start_id},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=vals,
+        ConditionExpression="lease_owner = :lo",
+        ExpressionAttributeValues={**vals, ":lo": request_id},
+    )
+
+
+def _ddb_done(job_start_id: str, request_id: str, note: str = "") -> None:
+    _ddb_checkpoint(job_start_id, request_id, "DONE", page=0, cursor=None, note=note, last_error="")
+
+
+def _ddb_error(job_start_id: str, request_id: str, page: int, cursor: Optional[str], err: str) -> None:
+    _ddb_checkpoint(job_start_id, request_id, "ERROR", page=page, cursor=cursor, note="error", last_error=err)
+
+
+# -------------------- API fetcher w/ rate-limit handling --------------------
+def _request_with_backoff(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    auth: Tuple[str, str],
+    bearer_key: str,
+) -> requests.Response:
+    backoff = BACKOFF_BASE_SECONDS
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        r = session.request(method, url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
+
+        # Bearer fallback on 401
+        if r.status_code == 401:
+            r = session.request(
+                method,
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {bearer_key}"},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    sleep_s = float(retry_after)
+                except Exception:
+                    sleep_s = backoff + random.random()
+            else:
+                sleep_s = backoff + random.random()  # jitter
+
+            backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+            logger.warning(
+                f"[{STREAM_NAME}] 429 rate limited attempt={attempt}/{MAX_RETRIES} sleep={sleep_s:.2f}s url={r.url}"
+            )
+            time.sleep(sleep_s)
+            continue
+
+        if r.status_code >= 500:
+            # transient server error — retry with backoff
+            sleep_s = backoff + random.random()
+            backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+            logger.warning(
+                f"[{STREAM_NAME}] {r.status_code} server error attempt={attempt}/{MAX_RETRIES} sleep={sleep_s:.2f}s url={r.url}"
+            )
+            time.sleep(sleep_s)
+            continue
+
+        return r
+
+    # If we got here, repeated 429/5xx; return last response-like error
+    raise RuntimeError(f"Exceeded max retries for {url} (likely repeated 429/5xx)")
+
+
+def _fetch_page(session: requests.Session, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str], Dict[str, str]]:
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
-    
-    # Cursor-only params to avoid 400 errors on messages
-    params = {"limit": PAGE_SIZE}
-    if cursor: params["cursor"] = cursor
 
-    r = requests.get(url, params=params, auth=(email, api_key), timeout=60)
-    if r.status_code == 401:
-        # Bearer fallback
-        headers = {"Authorization": f"Bearer {api_key}"}
-        r = requests.get(url, params=params, headers=headers, timeout=60)
-    
+    params: Dict[str, Any] = {"limit": PAGE_SIZE}
+    if cursor:
+        params["cursor"] = cursor
+
+    r = _request_with_backoff(session, "GET", url, params=params, auth=(email, api_key), bearer_key=api_key)
+
     if r.status_code >= 400:
+        # log body snippet but don't dump huge
         logger.error(f"[{STREAM_NAME}] HTTP {r.status_code} url={r.url} body={r.text[:500]}")
-    r.raise_for_status()
-    
-    _maybe_adaptive_sleep(dict(r.headers))
+        r.raise_for_status()
+
+    headers = dict(r.headers)
+    _throttle_on_success(headers)
+
     j = r.json()
-    
-    # Robust parsing like customers.py
-    items = []
-    if isinstance(j, dict): 
-        # Check standard keys
+    items: List[Dict[str, Any]] = []
+
+    if isinstance(j, dict):
         for k in ["data", "items", "results", STREAM_NAME]:
-            if k in j and isinstance(j[k], list): 
-                items = j[k]; break
-    
+            if k in j and isinstance(j[k], list):
+                items = j[k]
+                break
+
     next_cursor = None
     if isinstance(j, dict):
         meta = j.get("meta") or {}
         next_cursor = meta.get("next_cursor") or meta.get("nextCursor") or j.get("next_cursor")
-    
-    return items, next_cursor
 
+    return items, next_cursor, headers
+
+
+# -------------------- Lambda handler --------------------
 def handler(event, context):
+    request_id = getattr(context, "aws_request_id", "no_context")
+
+    # Parse SQS body (or direct invoke)
+    record = (event.get("Records") or [None])[0] if isinstance(event, dict) else None
+    body = {}
+    if record and isinstance(record, dict) and record.get("body"):
+        try:
+            body = json.loads(record["body"])
+        except Exception:
+            body = {"raw_body": record["body"]}
+    elif isinstance(event, dict):
+        body = event
+
+    job_start_id = (body or {}).get("job_start_id")
+    if not job_start_id:
+        raise ValueError("Missing job_start_id")
+
+    state = _ddb_get(job_start_id)
+    if not state:
+        logger.warning(f"[{STREAM_NAME}] missing state for job_start_id={job_start_id}")
+        return {"ok": False, "reason": "missing_state"}
+
+    if state.get("status") != "RUNNING":
+        return {"ok": True, "skipped": True, "status": state.get("status")}
+
+    # Acquire lease (prevents parallel invocations even if infra misconfigured)
+    if not _ddb_acquire_lease(job_start_id, request_id):
+        logger.info(f"[{STREAM_NAME}] lease not acquired (another invocation running). job_start_id={job_start_id}")
+        return {"ok": True, "skipped": True, "reason": "lease_busy"}
+
+    # Read checkpointed cursor/page
+    # Page is only for S3 file naming; cursor is the real pagination key.
+    cursor = (body.get("cursor") if isinstance(body, dict) else None) or state.get("cursor")
+    if cursor == "":
+        cursor = None
+
+    page = int((body.get("page") if isinstance(body, dict) else None) or state.get("page") or 1)
+
+    processed = 0
+    last_limit_hdr = None
+
+    session = requests.Session()
+
     try:
-        record = (event.get("Records") or [None])[0]
-        body = json.loads(record["body"]) if record and record.get("body") else (event or {})
-        job_start_id = body.get("job_start_id")
-        if not job_start_id: raise ValueError("Missing job_start_id")
-
-        state = _ddb_get(job_start_id)
-        if not state: return {"ok": False, "reason": "missing_state"}
-        if state.get("status") != "RUNNING": return {"ok": True, "skipped": True}
-
-        # Page is for S3 filename only.
-        page = int(body.get("page") or state.get("page") or 1)
-        cursor = body.get("cursor") or state.get("cursor")
-        if cursor == "": cursor = None
-
-        processed = 0
         while processed < PAGES_PER_INVOCATION and _time_left_ok(context):
-            items, next_cursor = _fetch_page(cursor)
-            
-            if not items:
-                _ddb_done(job_start_id, "no items")
-                return {"ok": True, "done": True}
-                
-            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
-            processed += 1
-            
-            if next_cursor:
-                cursor = next_cursor
-                page += 1
-            else:
-                _ddb_done(job_start_id, "completed")
-                return {"ok": True, "done": True}
+            # renew lease periodically
+            if processed > 0 and processed % LEASE_RENEW_EVERY_PAGES == 0:
+                _ddb_renew_lease(job_start_id, request_id)
 
-        # Unconditional update to fix looping
-        _ddb_update_running(job_start_id, page, cursor, f"processed {processed}")
-        return {"ok": True, "done": False}
+            try:
+                items, next_cursor, headers = _fetch_page(session, cursor)
+                lim = _parse_limit_header(headers)
+                if lim:
+                    last_limit_hdr = f"{lim[0]}/{lim[1]}"
+
+            except RuntimeError as e:
+                # This is our "exceeded retries" condition (likely repeated 429/5xx).
+                # DO NOT raise → checkpoint and exit gracefully to avoid SQS retry storms.
+                msg = str(e)
+                logger.warning(f"[{STREAM_NAME}] stopping early due to transient failures: {msg}")
+
+                _ddb_checkpoint(
+                    job_start_id=job_start_id,
+                    request_id=request_id,
+                    status="RUNNING",
+                    page=page,
+                    cursor=cursor,
+                    note=f"paused after {processed} pages (transient). limit={last_limit_hdr or 'n/a'}",
+                    last_error=msg,
+                )
+                return {"ok": True, "done": False, "paused": True, "processed": processed}
+
+            if not items:
+                _ddb_checkpoint(
+                    job_start_id=job_start_id,
+                    request_id=request_id,
+                    status="DONE",
+                    page=0,
+                    cursor=None,
+                    note="no items",
+                    last_error="",
+                )
+                return {"ok": True, "done": True, "processed": processed}
+
+            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
+
+            processed += 1
+            cursor = next_cursor
+            page += 1
+
+            # If no next cursor, we are done.
+            if not cursor:
+                _ddb_checkpoint(
+                    job_start_id=job_start_id,
+                    request_id=request_id,
+                    status="DONE",
+                    page=0,
+                    cursor=None,
+                    note=f"completed (processed {processed}) limit={last_limit_hdr or 'n/a'}",
+                    last_error="",
+                )
+                return {"ok": True, "done": True, "processed": processed}
+
+            # checkpoint every few pages so we don't re-hit same pages on restart
+            if processed % CHECKPOINT_EVERY_PAGES == 0:
+                _ddb_checkpoint(
+                    job_start_id=job_start_id,
+                    request_id=request_id,
+                    status="RUNNING",
+                    page=page,
+                    cursor=cursor,
+                    note=f"checkpoint processed={processed} limit={last_limit_hdr or 'n/a'}",
+                    last_error="",
+                )
+
+        # Out of time or hit pages-per-invocation: checkpoint and exit cleanly
+        _ddb_checkpoint(
+            job_start_id=job_start_id,
+            request_id=request_id,
+            status="RUNNING",
+            page=page,
+            cursor=cursor,
+            note=f"paused processed={processed} limit={last_limit_hdr or 'n/a'}",
+            last_error="",
+        )
+        return {"ok": True, "done": False, "processed": processed}
 
     except Exception as e:
-        logger.exception(f"[{STREAM_NAME}] error")
+        logger.exception(f"[{STREAM_NAME}] fatal error")
         try:
-            if 'job_start_id' in locals(): _ddb_error(job_start_id, str(e))
-        except: pass
+            _ddb_error(job_start_id, request_id, page=page, cursor=cursor, err=str(e))
+        except Exception:
+            pass
         raise
