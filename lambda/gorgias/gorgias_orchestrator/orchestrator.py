@@ -20,7 +20,7 @@ TABLE = _ddb.Table(STATE_TABLE)
 # Stream-specific configuration for daily jobs
 DAILY_CONFIG = {
     "customers": {
-        "start_hour": 15,   # 02:00 UTC
+        "start_hour": 2,   # 02:00 UTC
         "days_back": 1,    # Yesterday
     },
     "tickets": {
