@@ -219,6 +219,180 @@ aws.iam.RolePolicy(
     }}"""),
 )
 
+
+
+# -------------------------
+# Tickets: DAILY pipeline (NEW)
+# -------------------------
+gorgias_tickets_daily_rule = aws.cloudwatch.EventRule(
+    "gorgias-tickets-daily-rule",
+    name="gorgias-tickets-daily-rule",
+    schedule_expression="rate(1 minute)",  # Fires every minute, time check in code
+)
+
+gorgias_tickets_daily_dlq = aws.sqs.Queue(
+    "gorgias-tickets-daily-dlq",
+    name="gorgias-tickets-daily-dlq",
+    message_retention_seconds=1209600,
+)
+
+gorgias_tickets_daily_q = aws.sqs.Queue(
+    "gorgias-tickets-daily-queue",
+    name="gorgias-tickets-daily",
+    visibility_timeout_seconds=900,
+    receive_wait_time_seconds=20,
+    message_retention_seconds=1209600,
+    redrive_policy=gorgias_tickets_daily_dlq.arn.apply(lambda arn: f"""{{
+      "deadLetterTargetArn": "{arn}",
+      "maxReceiveCount": 5
+    }}"""),
+)
+pulumi.export("gorgias_tickets_daily_queue_url", gorgias_tickets_daily_q.url)
+
+gorgias_tickets_daily_role = aws.iam.Role(
+    "gorgias-tickets-daily-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-tickets-daily-basic",
+    role=gorgias_tickets_daily_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+aws.iam.RolePolicyAttachment(
+    "gorgias-tickets-daily-sqs-exec",
+    role=gorgias_tickets_daily_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+)
+aws.iam.RolePolicy(
+    "gorgias-tickets-daily-secrets",
+    role=gorgias_tickets_daily_role.id,
+    policy=secrets_read_policy,
+)
+aws.iam.RolePolicy(
+    "gorgias-tickets-daily-s3put",
+    role=gorgias_tickets_daily_role.id,
+    policy=f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["s3:PutObject"],
+        "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+      }}]
+    }}""",
+)
+aws.iam.RolePolicy(
+    "gorgias-tickets-daily-ddb",
+    role=gorgias_tickets_daily_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
+    }}"""),
+)
+
+gorgias_tickets_daily_fn = aws.lambda_.Function(
+    "gorgias-tickets-daily-lambda",
+    name="gorgias-tickets-daily-worker",
+    role=gorgias_tickets_daily_role.arn,
+    runtime="python3.13",
+    handler="gorgias_tickets.tickets.handler",
+    code=gorgias_code,
+    timeout=600,
+    reserved_concurrent_executions=1,
+    layers=[requests_layer.arn],
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "STATE_TABLE": gorgias_state_table.name,
+            "S3_BUCKET": GORGIAS_BUCKET_NAME,
+            "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
+            "PAGE_SIZE": "100",
+            "PAGES_PER_INVOCATION": "100",
+            "STREAM_NAME": "tickets",
+        }
+    ),
+)
+
+aws.lambda_.EventSourceMapping(
+    "gorgias-tickets-daily-esm",
+    event_source_arn=gorgias_tickets_daily_q.arn,
+    function_name=gorgias_tickets_daily_fn.arn,
+    batch_size=1,
+)
+pulumi.export("gorgias_tickets_daily_lambda_name", gorgias_tickets_daily_fn.name)
+
+gorgias_tickets_daily_orch_role = aws.iam.Role(
+    "gorgias-tickets-daily-orch-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-tickets-daily-orch-basic",
+    role=gorgias_tickets_daily_orch_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+aws.iam.RolePolicy(
+    "gorgias-tickets-daily-orch-ddb",
+    role=gorgias_tickets_daily_orch_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
+    }}"""),
+)
+aws.iam.RolePolicy(
+    "gorgias-tickets-daily-orch-sqs-send",
+    role=gorgias_tickets_daily_orch_role.id,
+    policy=gorgias_tickets_daily_q.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["sqs:SendMessage"],
+        "Resource":"{arn}"
+      }}]
+    }}"""),
+)
+
+gorgias_tickets_daily_orch_fn = aws.lambda_.Function(
+    "gorgias-tickets-daily-orch-lambda",
+    name="gorgias-tickets-daily-orchestrator",
+    role=gorgias_tickets_daily_orch_role.arn,
+    runtime="python3.13",
+    handler="gorgias_orchestrator.orchestrator.handler",
+    code=gorgias_code,
+    timeout=60,
+    layers=[],
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "STATE_TABLE": gorgias_state_table.name,
+            "BACKFILL_QUEUE_URL": gorgias_tickets_daily_q.url,
+            "STREAM_NAME": "tickets",  # Important for orchestrator to know the stream
+        }
+    ),
+)
+pulumi.export("gorgias_tickets_daily_orchestrator_name", gorgias_tickets_daily_orch_fn.name)
+
+aws.cloudwatch.EventTarget(
+    "gorgias-tickets-daily-target",
+    rule=gorgias_tickets_daily_rule.name,
+    arn=gorgias_tickets_daily_orch_fn.arn,
+    input='{"job_start_id":"gorgias_tickets_daily"}',  # Contains "daily"
+)
+
+aws.lambda_.Permission(
+    "gorgias-tickets-daily-invoke-permission",
+    action="lambda:InvokeFunction",
+    function=gorgias_tickets_daily_orch_fn.name,
+    principal="events.amazonaws.com",
+    source_arn=gorgias_tickets_daily_rule.arn,
+)
+
 # -------------------------
 # Legacy FIFO streams (kept so Pulumi won't delete existing FIFO resources)
 # -------------------------
@@ -469,6 +643,7 @@ gorgias_messages_fifo_q, gorgias_messages_fifo_fn = make_gorgias_stream(
 # -------------------------
 gorgias_orchestrator_rule = aws.cloudwatch.EventRule(
     "gorgias-orchestrator-every-minute",
+    name="gorgias-customers-daily-rule",  # Add explicit name
     schedule_expression="rate(1 minute)",
 )
 
@@ -538,6 +713,7 @@ aws.iam.RolePolicy(
 
 gorgias_customers_fn = aws.lambda_.Function(
     "gorgias-customers-lambda",
+    name="gorgias-customers-worker",
     role=gorgias_customers_role.arn,
     runtime="python3.13",
     handler="gorgias_customers.customers.handler",
@@ -613,6 +789,7 @@ aws.iam.RolePolicy(
 
 gorgias_orchestrator_fn = aws.lambda_.Function(
     "gorgias-orchestrator-lambda",
+    name="gorgias-customers-orchestrator",
     role=gorgias_orchestrator_role.arn,
     runtime="python3.13",
     handler="gorgias_orchestrator.orchestrator.handler",
@@ -626,6 +803,7 @@ gorgias_orchestrator_fn = aws.lambda_.Function(
             "VISIBILITY_TIMEOUT_SEC": "900",
             "LEASE_BUFFER_SEC": "60",
             "ORCHESTRATOR_RULE_NAME": gorgias_orchestrator_rule.name,
+            "STREAM_NAME": "customers",
             # NEW: Explicit Start Hour for visibility
             "DAILY_START_HOUR": "2",
         }
