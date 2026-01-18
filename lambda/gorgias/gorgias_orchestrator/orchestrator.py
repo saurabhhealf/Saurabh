@@ -21,11 +21,11 @@ TABLE = _ddb.Table(STATE_TABLE)
 DAILY_CONFIG = {
     "customers": {
         "start_hour": 2,   # 02:00 UTC
-        "days_back": 5,    # Yesterday
+        "days_back": 1,    # Yesterday
     },
     "tickets": {
         "start_hour": 3,   # 03:00 UTC
-        "days_back": 5,    # Last 2 days
+        "days_back": 1,    # Last 2 days
     },
 }
 DEFAULT_START_HOUR = 2
@@ -67,7 +67,7 @@ def handler(event, context):
 
         # Only run during the designated hour
 
-        '''
+
         if now_dt.hour != daily_start_hour:
             return {
                 "enqueued": False,
@@ -76,15 +76,6 @@ def handler(event, context):
                 "current_hour": now_dt.hour,
                 "expected_hour": daily_start_hour,
             }
-'''
-        if STREAM_NAME != "tickets" and now_dt.hour != daily_start_hour:
-                return {
-                    "enqueued": False,
-                    "reason": "outside_daily_window",
-                    "stream": STREAM_NAME,
-                    "current_hour": now_dt.hour,
-                    "expected_hour": daily_start_hour,
-                }
 
 
         # Calculate Target Date
