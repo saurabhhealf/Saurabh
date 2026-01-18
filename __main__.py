@@ -515,6 +515,7 @@ def make_gorgias_orchestrated_stream(
         handler=handler,
         code=gorgias_code,
         timeout=600,
+        memory_size=512,
         reserved_concurrent_executions=max_concurrency,
         layers=[requests_layer.arn],
         environment=aws.lambda_.FunctionEnvironmentArgs(
