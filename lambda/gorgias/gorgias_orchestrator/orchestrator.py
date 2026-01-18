@@ -150,7 +150,7 @@ def handler(event, context):
         return {"enqueued": False, "reason": "lease_active"}
 
     # Acquire Lease (15 min)
-    new_lease = now + 900
+    new_lease = 0
     try:
         TABLE.update_item(
             Key={"job_start_id": job_start_id},
