@@ -1,7 +1,0 @@
-{
-  "job_start_id": {"S": "gorgias_tickets_backfill"},
-  "status": {"S": "RUNNING"},
-  "in_flight": {"BOOL": false},
-  "lease_until": {"N": "0"},
-  "page": {"N": "1"}
-}

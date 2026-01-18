@@ -21,11 +21,11 @@ TABLE = _ddb.Table(STATE_TABLE)
 DAILY_CONFIG = {
     "customers": {
         "start_hour": 2,   # 02:00 UTC
-        "days_back": 1,    # Yesterday
+        "days_back": 5,    # Yesterday
     },
     "tickets": {
         "start_hour": 3,   # 03:00 UTC
-        "days_back": 2,    # Last 2 days
+        "days_back": 5,    # Last 2 days
     },
 }
 DEFAULT_START_HOUR = 2
@@ -66,6 +66,7 @@ def handler(event, context):
         days_back = config.get("days_back", DEFAULT_DAYS_BACK)
 
         # Only run during the designated hour
+        '''
         if now_dt.hour != daily_start_hour:
             return {
                 "enqueued": False,
@@ -74,7 +75,7 @@ def handler(event, context):
                 "current_hour": now_dt.hour,
                 "expected_hour": daily_start_hour,
             }
-
+'''
         # Calculate Target Date
         target_date = (now_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
