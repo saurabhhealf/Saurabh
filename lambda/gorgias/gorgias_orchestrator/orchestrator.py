@@ -67,6 +67,7 @@ def handler(event, context):
 
         # Only run during the designated hour
 
+        '''
         if now_dt.hour != daily_start_hour:
             return {
                 "enqueued": False,
@@ -75,6 +76,15 @@ def handler(event, context):
                 "current_hour": now_dt.hour,
                 "expected_hour": daily_start_hour,
             }
+'''
+        if STREAM_NAME != "tickets" and now_dt.hour != daily_start_hour:
+                return {
+                    "enqueued": False,
+                    "reason": "outside_daily_window",
+                    "stream": STREAM_NAME,
+                    "current_hour": now_dt.hour,
+                    "expected_hour": daily_start_hour,
+                }
 
 
         # Calculate Target Date
