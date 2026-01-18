@@ -76,6 +76,14 @@ def handler(event, context):
                 "expected_hour": daily_start_hour,
             }
 '''
+        if STREAM_NAME != "customers" and now_dt.hour != daily_start_hour:
+                return {
+                    "enqueued": False,
+                    "reason": "outside_daily_window",
+                    "stream": STREAM_NAME,
+                    "current_hour": now_dt.hour,
+                    "expected_hour": daily_start_hour,
+                }
         # Calculate Target Date
         target_date = (now_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
