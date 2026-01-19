@@ -240,17 +240,16 @@ def _ddb_checkpoint(
 ) -> None:
     now = _utc_now_ts()
 
+    # 1. Start with SET clause
     expr = "SET #status=:s, #page=:p, #updated_at=:now, in_flight=:f"
     names = {"#status": "status", "#page": "page", "#updated_at": "updated_at"}
     vals: Dict[str, Any] = {":s": status, ":p": page, ":now": now, ":f": False}
 
+    # 2. Add all SET attributes (Cursor, Note, Error)
     if cursor:
         expr += ", #cursor=:c"
         names["#cursor"] = "cursor"
         vals[":c"] = cursor
-    else:
-        expr += " REMOVE #cursor"
-        names["#cursor"] = "cursor"
 
     if note:
         expr += ", #note=:n"
@@ -262,6 +261,12 @@ def _ddb_checkpoint(
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
 
+    # 3. Add REMOVE clause LAST (only if cursor is missing)
+    if not cursor:
+        expr += " REMOVE #cursor"
+        names["#cursor"] = "cursor"
+
+    # 4. Execute
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
         UpdateExpression=expr,
