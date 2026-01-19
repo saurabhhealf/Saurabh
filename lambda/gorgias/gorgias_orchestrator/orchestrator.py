@@ -18,6 +18,7 @@ QUEUE_URL = os.environ["BACKFILL_QUEUE_URL"]
 TABLE = _ddb.Table(STATE_TABLE)
 
 # Stream-specific configuration for daily jobs
+
 DAILY_CONFIG = {
     "customers": {
         "start_hour": 2,   # 02:00 UTC
@@ -25,7 +26,12 @@ DAILY_CONFIG = {
     },
     "tickets": {
         "start_hour": 3,   # 03:00 UTC
-        "days_back": 1,    # Last 2 days
+        "days_back": 1,    # Yesterday
+    },
+    # ADD THIS BLOCK:
+    "messages": {
+        "start_hour": 4,   # 04:00 UTC
+        "days_back": 1,    # Yesterday
     },
 }
 DEFAULT_START_HOUR = 2
