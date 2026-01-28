@@ -953,6 +953,192 @@ aws.lambda_.Permission(
 )
 
 # -------------------------
+# Users: DAILY pipeline (Full Snapshot)
+# -------------------------
+gorgias_users_daily_rule = aws.cloudwatch.EventRule(
+    "gorgias-users-daily-rule",
+    name="gorgias-users-daily-rule",
+    schedule_expression="cron(0 6 * * ? *)", # Fires at 06:00 UTC
+)
+
+gorgias_users_daily_dlq = aws.sqs.Queue(
+    "gorgias-users-daily-dlq",
+    name="gorgias-users-daily-dlq",
+    message_retention_seconds=1209600,
+)
+
+gorgias_users_daily_q = aws.sqs.Queue(
+    "gorgias-users-daily-queue",
+    name="gorgias-users-daily",
+    visibility_timeout_seconds=900,
+    receive_wait_time_seconds=20,
+    message_retention_seconds=1209600,
+    redrive_policy=gorgias_users_daily_dlq.arn.apply(lambda arn: f"""{{
+      "deadLetterTargetArn": "{arn}",
+      "maxReceiveCount": 5
+    }}"""),
+)
+pulumi.export("gorgias_users_daily_queue_url", gorgias_users_daily_q.url)
+
+gorgias_users_daily_role = aws.iam.Role(
+    "gorgias-users-daily-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-users-daily-basic",
+    role=gorgias_users_daily_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+aws.iam.RolePolicyAttachment(
+    "gorgias-users-daily-sqs-exec",
+    role=gorgias_users_daily_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole",
+)
+aws.iam.RolePolicy(
+    "gorgias-users-daily-secrets",
+    role=gorgias_users_daily_role.id,
+    policy=secrets_read_policy,
+)
+aws.iam.RolePolicy(
+    "gorgias-users-daily-s3put",
+    role=gorgias_users_daily_role.id,
+    policy=f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["s3:PutObject"],
+        "Resource":"arn:aws:s3:::{GORGIAS_BUCKET_NAME}/{GORGIAS_S3_PREFIX}/*"
+      }}]
+    }}""",
+)
+aws.iam.RolePolicy(
+    "gorgias-users-daily-ddb",
+    role=gorgias_users_daily_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
+    }}"""),
+)
+
+gorgias_users_daily_fn = aws.lambda_.Function(
+    "gorgias-users-daily-lambda",
+    name="gorgias-users-daily-worker",
+    role=gorgias_users_daily_role.arn,
+    runtime="python3.13",
+    handler="gorgias_users.users.handler",
+    code=gorgias_code,
+    timeout=600,
+    memory_size=512,  
+    reserved_concurrent_executions=1,
+    layers=[requests_layer.arn],
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "STATE_TABLE": gorgias_state_table.name,
+            "S3_BUCKET": GORGIAS_BUCKET_NAME,
+            "S3_PREFIX_BASE": GORGIAS_S3_PREFIX,
+            "PAGE_SIZE": "100",
+            "PAGES_PER_INVOCATION": "100",
+            "STREAM_NAME": "users",
+        }
+    ),
+)
+
+aws.lambda_.EventSourceMapping(
+    "gorgias-users-daily-esm",
+    event_source_arn=gorgias_users_daily_q.arn,
+    function_name=gorgias_users_daily_fn.arn,
+    batch_size=1,
+)
+pulumi.export("gorgias_users_daily_lambda_name", gorgias_users_daily_fn.name)
+
+gorgias_users_daily_orch_role = aws.iam.Role(
+    "gorgias-users-daily-orch-role",
+    assume_role_policy=assume_role_policy,
+)
+
+aws.iam.RolePolicyAttachment(
+    "gorgias-users-daily-orch-basic",
+    role=gorgias_users_daily_orch_role.id,
+    policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+)
+aws.iam.RolePolicy(
+    "gorgias-users-daily-orch-ddb",
+    role=gorgias_users_daily_orch_role.id,
+    policy=gorgias_state_table.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["dynamodb:GetItem","dynamodb:UpdateItem","dynamodb:PutItem"],
+        "Resource":"{arn}"
+      }}]
+    }}"""),
+)
+aws.iam.RolePolicy(
+    "gorgias-users-daily-orch-sqs-send",
+    role=gorgias_users_daily_orch_role.id,
+    policy=gorgias_users_daily_q.arn.apply(lambda arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["sqs:SendMessage"],
+        "Resource":"{arn}"
+      }}]
+    }}"""),
+)
+aws.iam.RolePolicy(
+    "gorgias-users-daily-orch-events-disable",
+    role=gorgias_users_daily_orch_role.id,
+    policy=gorgias_users_daily_rule.arn.apply(lambda rule_arn: f"""{{
+      "Version":"2012-10-17",
+      "Statement":[{{
+        "Effect":"Allow",
+        "Action":["events:DisableRule"],
+        "Resource":"{rule_arn}"
+      }}]
+    }}"""),
+)
+
+gorgias_users_daily_orch_fn = aws.lambda_.Function(
+    "gorgias-users-daily-orch-lambda",
+    name="gorgias-users-daily-orchestrator",
+    role=gorgias_users_daily_orch_role.arn,
+    runtime="python3.13",
+    handler="gorgias_orchestrator.orchestrator.handler",
+    code=gorgias_code,
+    timeout=60,
+    layers=[],
+    environment=aws.lambda_.FunctionEnvironmentArgs(
+        variables={
+            "STATE_TABLE": gorgias_state_table.name,
+            "BACKFILL_QUEUE_URL": gorgias_users_daily_q.url,
+            "STREAM_NAME": "users",
+            "DAILY_START_HOUR": "6",
+        }
+    ),
+)
+pulumi.export("gorgias_users_daily_orchestrator_name", gorgias_users_daily_orch_fn.name)
+
+aws.cloudwatch.EventTarget(
+    "gorgias-users-daily-target",
+    rule=gorgias_users_daily_rule.name,
+    arn=gorgias_users_daily_orch_fn.arn,
+    input='{"job_start_id":"gorgias_users_daily"}', 
+)
+
+aws.lambda_.Permission(
+    "gorgias-users-daily-invoke-permission",
+    action="lambda:InvokeFunction",
+    function=gorgias_users_daily_orch_fn.name,
+    principal="events.amazonaws.com",
+    source_arn=gorgias_users_daily_rule.arn,
+)
+
+# -------------------------
 # Legacy FIFO streams (kept so Pulumi won't delete existing FIFO resources)
 # -------------------------
 def make_gorgias_stream(name: str, handler: str, max_concurrency: int = 1):
