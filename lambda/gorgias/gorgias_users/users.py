@@ -29,7 +29,7 @@ STREAM_NAME = "users"
 ENDPOINT = "/users"
 
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
-PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "20"))
+PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "50"))
 
 # Rate limit + retries
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
@@ -40,9 +40,10 @@ THROTTLE_RATIO = float(os.environ.get("THROTTLE_RATIO", "0.70"))
 THROTTLE_MAX_SLEEP_SECONDS = float(os.environ.get("THROTTLE_MAX_SLEEP_SECONDS", "2.0"))
 
 # Lambda time handling
-TIME_LEFT_BUFFER_MS = 12_000
 REQUEST_TIMEOUT = (10, 60)
+TIME_LEFT_BUFFER_MS = 12_000
 
+# Secrets
 GORGIAS_EMAIL_SECRET = os.environ.get("GORGIAS_EMAIL_SECRET", "gorgias_email")
 GORGIAS_API_KEY_SECRET = os.environ.get("GORGIAS_API_KEY_SECRET", "gorgias_api_key")
 
