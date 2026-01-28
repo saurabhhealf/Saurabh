@@ -2,47 +2,62 @@ import os
 import json
 import time
 import uuid
+import random
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# -------------------- AWS clients --------------------
 _ddb = boto3.resource("dynamodb")
 _s3 = boto3.client("s3")
 _sm = boto3.client("secretsmanager")
 
+# -------------------- Env --------------------
 GORGIAS_BASE_URL = os.environ.get("GORGIAS_BASE_URL", "https://healf-uk.gorgias.com/api").rstrip("/")
 STATE_TABLE = os.environ["STATE_TABLE"]
 S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
 S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias").strip("/")
 
+STREAM_NAME = "users"
+ENDPOINT = "/users"
+
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "20"))
+
+# Rate limit + retries
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
+BACKOFF_BASE_SECONDS = float(os.environ.get("BACKOFF_BASE_SECONDS", "1.0"))
+BACKOFF_MAX_SECONDS = float(os.environ.get("BACKOFF_MAX_SECONDS", "30.0"))
+MIN_SUCCESS_DELAY_SECONDS = float(os.environ.get("MIN_SUCCESS_DELAY_SECONDS", "0.2"))
+THROTTLE_RATIO = float(os.environ.get("THROTTLE_RATIO", "0.70"))
+THROTTLE_MAX_SLEEP_SECONDS = float(os.environ.get("THROTTLE_MAX_SLEEP_SECONDS", "2.0"))
+
+# Lambda time handling
+TIME_LEFT_BUFFER_MS = 12_000
+REQUEST_TIMEOUT = (10, 60)
 
 GORGIAS_EMAIL_SECRET = os.environ.get("GORGIAS_EMAIL_SECRET", "gorgias_email")
 GORGIAS_API_KEY_SECRET = os.environ.get("GORGIAS_API_KEY_SECRET", "gorgias_api_key")
 
-STREAM_NAME = "users"
-ENDPOINT = "/users"
-
 TABLE = _ddb.Table(STATE_TABLE)
 
 
+# -------------------- Helpers --------------------
 def _utc_now_ts() -> int:
     return int(time.time())
-
 
 def _safe_json_loads(s: str) -> Any:
     try:
         return json.loads(s)
     except Exception:
         return None
-
 
 def _get_secret_value(secret_id: str) -> str:
     resp = _sm.get_secret_value(SecretId=secret_id)
@@ -51,9 +66,8 @@ def _get_secret_value(secret_id: str) -> str:
     if isinstance(parsed, dict):
         for k in ["value", "secret", "token", "api_key", "apiKey", "key", "password", "email", "username"]:
             if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
-                return parsed[k].strip()
-    return secret
-
+                return parsed[k].strip().strip('"').strip("'")
+    return secret.strip().strip('"').strip("'")
 
 def _gorgias_auth() -> Tuple[str, str]:
     email = _get_secret_value(GORGIAS_EMAIL_SECRET)
@@ -62,8 +76,7 @@ def _gorgias_auth() -> Tuple[str, str]:
         raise ValueError("Missing Gorgias credentials")
     return email, api_key
 
-
-def _time_left_ok(context, buffer_ms: int = 12_000) -> bool:
+def _time_left_ok(context, buffer_ms: int = TIME_LEFT_BUFFER_MS) -> bool:
     if context is None:
         return True
     try:
@@ -71,6 +84,31 @@ def _time_left_ok(context, buffer_ms: int = 12_000) -> bool:
     except Exception:
         return True
 
+def _parse_limit_header(headers: Dict[str, str]) -> Optional[Tuple[int, int]]:
+    h = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
+    if not h:
+        return None
+    try:
+        used_s, limit_s = h.split("/", 1)
+        used = int(used_s.strip())
+        limit = int(limit_s.strip())
+        if limit <= 0:
+            return None
+        return used, limit
+    except Exception:
+        return None
+
+def _throttle_on_success(headers: Dict[str, str]) -> None:
+    parsed = _parse_limit_header(headers)
+    sleep_s = MIN_SUCCESS_DELAY_SECONDS if MIN_SUCCESS_DELAY_SECONDS > 0 else 0.0
+    if parsed:
+        used, limit = parsed
+        ratio = used / limit
+        if ratio >= THROTTLE_RATIO:
+            ramp = (ratio - THROTTLE_RATIO) / max(1e-9, (1.0 - THROTTLE_RATIO))
+            sleep_s = max(sleep_s, min(THROTTLE_MAX_SLEEP_SECONDS, 0.2 + ramp * THROTTLE_MAX_SLEEP_SECONDS))
+    if sleep_s > 0:
+        time.sleep(sleep_s)
 
 def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]]) -> str:
     if not records:
@@ -85,13 +123,13 @@ def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
     return key
 
-
+# -------------------- DDB State --------------------
 def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]:
     return TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
 
-
 def _ddb_update_running(job_start_id: str, next_page: int, next_cursor: Optional[str], note: str = "") -> None:
     now = _utc_now_ts()
+    # 1. Build SET clause first
     expr = "SET #status=:running, #in_flight=:false, #lease_until=:zero, #page=:p, #updated_at=:now"
     names = {
         "#status": "status",
@@ -107,17 +145,21 @@ def _ddb_update_running(job_start_id: str, next_page: int, next_cursor: Optional
         ":p": next_page,
         ":now": now,
     }
+
     if next_cursor:
         expr += ", #cursor=:c"
         names["#cursor"] = "cursor"
         vals[":c"] = next_cursor
-    else:
-        expr += " REMOVE #cursor"
-        names["#cursor"] = "cursor"
+    
     if note:
         expr += ", #note=:n"
         names["#note"] = "note"
         vals[":n"] = note[:2000]
+
+    # 2. Append REMOVE clause LAST (Critical fix for DynamoDB syntax)
+    if not next_cursor:
+        expr += " REMOVE #cursor"
+        names["#cursor"] = "cursor"
 
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
@@ -126,9 +168,9 @@ def _ddb_update_running(job_start_id: str, next_page: int, next_cursor: Optional
         ExpressionAttributeValues=vals,
     )
 
-
 def _ddb_done(job_start_id: str, note: str = "") -> None:
     now = _utc_now_ts()
+    # Build SET clause
     expr = "SET #status=:done, #in_flight=:false, #lease_until=:zero, #updated_at=:now"
     names = {
         "#status": "status",
@@ -137,17 +179,18 @@ def _ddb_done(job_start_id: str, note: str = "") -> None:
         "#updated_at": "updated_at",
     }
     vals: Dict[str, Any] = {":done": "DONE", ":false": False, ":zero": 0, ":now": now}
+    
     if note:
         expr += ", #note=:n"
         names["#note"] = "note"
         vals[":n"] = note[:2000]
+        
     TABLE.update_item(
         Key={"job_start_id": job_start_id},
         UpdateExpression=expr,
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=vals,
     )
-
 
 def _ddb_error(job_start_id: str, err: str) -> None:
     now = _utc_now_ts()
@@ -170,6 +213,52 @@ def _ddb_error(job_start_id: str, err: str) -> None:
         },
     )
 
+# -------------------- API Fetcher --------------------
+def _request_with_backoff(session: requests.Session, method: str, url: str, params: Dict[str, Any], auth: Tuple[str, str], bearer_key: str) -> requests.Response:
+    backoff = BACKOFF_BASE_SECONDS
+    last_resp = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.request(method, url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
+            last_resp = r
+            
+            # 401 fallback: Try Bearer token if Basic Auth fails
+            if r.status_code == 401:
+                r = session.request(method, url, params=params, headers={"Authorization": f"Bearer {bearer_key}"}, timeout=REQUEST_TIMEOUT)
+                last_resp = r
+
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        sleep_s = float(retry_after)
+                    except:
+                        sleep_s = backoff
+                else:
+                    sleep_s = backoff + random.random()
+                
+                logger.warning(f"[{STREAM_NAME}] 429 rate limited. attempt={attempt}. sleeping {sleep_s:.2f}s")
+                time.sleep(sleep_s)
+                backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+                continue
+            
+            if r.status_code >= 500:
+                sleep_s = backoff + random.random()
+                logger.warning(f"[{STREAM_NAME}] {r.status_code} server error. attempt={attempt}. sleeping {sleep_s:.2f}s")
+                time.sleep(sleep_s)
+                backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+                continue
+                
+            return r
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"[{STREAM_NAME}] Network error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+
+    if last_resp:
+        last_resp.raise_for_status()
+    raise RuntimeError(f"Exceeded max retries for {url}")
 
 def _parse_items(resp_json: Any) -> List[Dict[str, Any]]:
     if isinstance(resp_json, dict):
@@ -183,7 +272,6 @@ def _parse_items(resp_json: Any) -> List[Dict[str, Any]]:
     if isinstance(resp_json, list):
         return resp_json
     return []
-
 
 def _parse_next_cursor(resp_json: Any) -> Optional[str]:
     if isinstance(resp_json, dict):
@@ -199,8 +287,7 @@ def _parse_next_cursor(resp_json: Any) -> Optional[str]:
                 return v.strip()
     return None
 
-
-def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _fetch_page(session: requests.Session, page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
 
@@ -208,7 +295,6 @@ def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]],
         "limit": PAGE_SIZE,
         "per_page": PAGE_SIZE,
         "page": page,
-        # ASC from the beginning
         "order_by": "created_datetime",
         "order_direction": "asc",
         "sort": "created_datetime",
@@ -217,12 +303,16 @@ def _fetch_page(page: int, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]],
     if cursor:
         params["cursor"] = cursor
 
-    r = requests.get(url, params=params, auth=(email, api_key), timeout=60)
-    r.raise_for_status()
+    # Use robust request with fallback
+    r = _request_with_backoff(session, "GET", url, params, (email, api_key), api_key)
+    
+    headers = dict(r.headers)
+    _throttle_on_success(headers)
+
     j = r.json()
     return _parse_items(j), _parse_next_cursor(j)
 
-
+# -------------------- Main Handler --------------------
 def handler(event, context):
     try:
         record = (event.get("Records") or [None])[0]
@@ -245,9 +335,10 @@ def handler(event, context):
 
         processed_pages = 0
         total_rows = 0
+        session = requests.Session()
 
         while processed_pages < PAGES_PER_INVOCATION and _time_left_ok(context):
-            items, next_cursor = _fetch_page(page=page, cursor=cursor)
+            items, next_cursor = _fetch_page(session, page=page, cursor=cursor)
 
             if not items:
                 _ddb_done(job_start_id, note=f"no_items page={page} cursor_present={bool(cursor)}")
@@ -267,12 +358,14 @@ def handler(event, context):
                     return {"ok": True, "done": True, "rows": total_rows}
                 page += 1
 
-        _ddb_update_running(
-            job_start_id,
-            next_page=page,
-            next_cursor=cursor if cursor else None,
-            note=f"continuing pages_processed={processed_pages} rows={total_rows}",
-        )
+            # Checkpoint every page
+            _ddb_update_running(
+                job_start_id,
+                next_page=page,
+                next_cursor=cursor if cursor else None,
+                note=f"continuing pages_processed={processed_pages} rows={total_rows}",
+            )
+
         return {"ok": True, "done": False, "rows": total_rows, "next_page": page, "cursor_present": bool(cursor)}
 
     except Exception as e:
@@ -282,6 +375,9 @@ def handler(event, context):
             if event and event.get("Records"):
                 body = json.loads(event["Records"][0]["body"])
                 job_start_id = body.get("job_start_id")
+            elif isinstance(event, dict):
+                job_start_id = event.get("job_start_id")
+                
             if job_start_id:
                 _ddb_error(job_start_id, str(e))
         except Exception:
