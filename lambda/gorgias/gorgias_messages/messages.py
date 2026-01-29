@@ -1,11 +1,9 @@
 """
-messages.py — Gorgias /messages extractor (Backfill + Daily)
+messages.py — Gorgias /messages extractor (Hourly + Backfill)
 
-Goals:
-- Supports Backfill (fetch all) AND Daily (incremental window).
-- Robust Rate Limiting: Backoff + Jitter on 429s.
-- Concurrency Safety: Uses DDB Leases.
-- Checkpointing: Resumes exactly where it left off.
+Updates:
+- Supports Hourly format (YYYY-MM-DDTHH) from Orchestrator.
+- Uses API-side filtering (created_datetime[gte/lte]) for efficiency.
 """
 
 import os
@@ -138,6 +136,30 @@ def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
     return key
 
+# -------------------- Date Helpers (NEW) --------------------
+def _get_hour_range(target_date_str: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parses 'YYYY-MM-DD' (Daily) or 'YYYY-MM-DDTHH' (Hourly).
+    Returns (start_ts, end_ts) in ISO format for API filtering.
+    """
+    if not target_date_str:
+        return None, None
+        
+    # Case 1: Daily (Legacy / Manual Backfill) -> "2026-01-29"
+    if len(target_date_str) == 10:
+        return f"{target_date_str}T00:00:00Z", f"{target_date_str}T23:59:59Z"
+    
+    # Case 2: Hourly (Orchestrator) -> "2026-01-29T14"
+    try:
+        dt = datetime.strptime(target_date_str, "%Y-%m-%dT%H")
+        start_ts = dt.strftime("%Y-%m-%dT%H:00:00Z")
+        # End of that specific hour
+        end_ts = (dt + timedelta(minutes=59, seconds=59)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return start_ts, end_ts
+    except ValueError:
+        logger.warning(f"Could not parse target_date: {target_date_str}")
+        return None, None
+
 # -------------------- DDB State / Lease --------------------
 def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]:
     resp = TABLE.get_item(Key={"job_start_id": job_start_id})
@@ -179,7 +201,6 @@ def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
             return
         raise
 
-# FIXED: Reordered logic to put REMOVE at the end
 def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str], note: str = "", last_error: str = "") -> None:
     now = _utc_now_ts()
     
@@ -263,40 +284,41 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
 
     raise RuntimeError(f"Exceeded max retries. Last status: {last_resp.status_code if last_resp else 'None'}")
 
-def _fetch_page(session: requests.Session, cursor: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str], Dict[str, str]]:
+def _fetch_page(session, page, cursor, target_date):
+    """
+    Fetches a single page of messages.
+    If 'target_date' is provided, applies API-side filtering (gte/lte).
+    """
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
     
-    # Updated to sort descending for daily logic
     params = {
         "limit": PAGE_SIZE,
-        "order_by": "created_datetime:desc"
+        "order_by": "created_datetime",
+        "direction": "asc" # Important: Ascending to get oldest first
     }
     if cursor:
         params["cursor"] = cursor
 
-    r = _request_with_backoff(session, "GET", url, params, (email, api_key), api_key)
-    
-    if r.status_code >= 400:
-        logger.error(f"[{STREAM_NAME}] HTTP {r.status_code} body={r.text[:500]}")
-        r.raise_for_status()
+    # --- API-SIDE DATE FILTERING ---
+    # This prevents fetching thousands of irrelevant records.
+    if target_date:
+        start_ts, end_ts = _get_hour_range(target_date)
+        if start_ts and end_ts:
+            params["created_datetime[gte]"] = start_ts
+            params["created_datetime[lte]"] = end_ts
 
+    r = _request_with_backoff(session, "GET", url, params, (email, api_key), api_key)
     headers = dict(r.headers)
     _throttle_on_success(headers)
-    
-    j = r.json()
-    items = []
-    if isinstance(j, dict):
-        for k in ["data", "items", "results", "messages"]:
-            if k in j and isinstance(j[k], list):
-                items = j[k]
-                break
-    
-    next_cursor = None
-    if isinstance(j, dict):
-        meta = j.get("meta") or {}
-        next_cursor = meta.get("next_cursor") or meta.get("nextCursor")
 
+    j = r.json()
+    items = j.get("data") or j.get("messages") or []
+    
+    # Parse cursor
+    meta = j.get("meta") or {}
+    next_cursor = meta.get("next_cursor") or meta.get("cursor_next")
+    
     return items, next_cursor, headers
 
 # -------------------- Main Handler --------------------
@@ -319,20 +341,10 @@ def handler(event, context):
         logger.error(f"[{STREAM_NAME}] Missing job_start_id. event={json.dumps(event)[:1000]}")
         return {"ok": False, "reason": "missing_job_start_id"}
 
-    # --- Date Window Logic (Daily) ---
+    # --- Date Window Logic ---
     target_date_str = body.get("target_date")
+    # If target_date is present, we filter by it. If missing, it's a full backfill.
     
-    is_daily = target_date_str is not None
-    
-    if is_daily:
-        try:
-            start_of_window = datetime.strptime(target_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            logger.error(f"Invalid target_date format: {target_date_str}")
-            return {"ok": False, "reason": "invalid_date"}
-    else:
-        start_of_window = None
-
     # Check State
     state = _ddb_get(job_start_id)
     if not state:
@@ -362,55 +374,27 @@ def handler(event, context):
                 _ddb_renew_lease(job_start_id, request_id)
 
             try:
-                items, next_cursor, headers = _fetch_page(session, cursor)
+                # Pass target_date to fetcher for API-side filtering
+                items, next_cursor, headers = _fetch_page(session, page, cursor, target_date_str)
             except RuntimeError as e:
                 msg = str(e)
                 logger.warning(f"[{STREAM_NAME}] Transient failure: {msg}")
                 _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused: {msg}")
                 return {"ok": True, "done": False, "reason": "transient_error"}
 
+            # If API returns no items, we are done (because we filtered by date in the API call)
             if not items:
-                _ddb_done(job_start_id, "completed (no items)")
+                _ddb_done(job_start_id, "completed (no items in window)")
                 return {"ok": True, "done": True}
 
-            # Filter items by date window (Daily only)
-            valid_items = []
-            reached_end_of_window = False
-            
-            if is_daily:
-                for item in items:
-                    # Messages use created_datetime usually
-                    upd = item.get("created_datetime")
-                    if not upd: continue
-                    try:
-                        upd_dt = datetime.fromisoformat(upd.replace("Z", "+00:00"))
-                    except:
-                        continue
-                    
-                    if upd_dt >= start_of_window:
-                        valid_items.append(item)
-                    else:
-                        reached_end_of_window = True
-                        break
-            else:
-                # Backfill: keep all items
-                valid_items = items
-            
-            # Write valid items
-            if valid_items:
-                _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, valid_items)
+            # Write items (All items returned are valid because of API filtering)
+            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
 
             processed += 1
             cursor = next_cursor
             page += 1
 
-            # Stop condition 1: Data is too old (Daily only)
-            if is_daily and reached_end_of_window:
-                logger.info(f"[{STREAM_NAME}] Reached data older than {target_date_str}. Done.")
-                _ddb_done(job_start_id, f"completed window {target_date_str}")
-                return {"ok": True, "done": True}
-
-            # Stop condition 2: No more pages from API
+            # Stop condition: No more pages from API
             if not cursor:
                 _ddb_done(job_start_id, "completed (end of stream)")
                 return {"ok": True, "done": True}
