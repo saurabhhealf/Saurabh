@@ -181,16 +181,22 @@ def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
             return
         raise
 
-def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str], note: str = "", last_error: str = "") -> None:
+def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str],
+                    note: str = "", last_error: str = "", lease_owner: Optional[str] = None) -> None:
     now = _utc_now_ts()
-    expr = "SET #status=:s, #page=:p, #updated_at=:now, in_flight=:f"
-    names = {"#status": "status", "#page": "page", "#updated_at": "updated_at"}
-    vals = {":s": status, ":p": page, ":now": now, ":f": False}
 
+    expr = "SET #status=:s, #page=:p, #updated_at=:now, in_flight=:f, #lease_until=:z"
+    names = {"#status": "status", "#page": "page", "#updated_at": "updated_at", "#lease_until": "lease_until"}
+    vals = {":s": status, ":p": page, ":now": now, ":f": False, ":z": 0}
+
+    # keep cursor if present
     if cursor:
         expr += ", #cursor=:c"
         names["#cursor"] = "cursor"
         vals[":c"] = cursor
+    else:
+        expr += " REMOVE #cursor"
+        names["#cursor"] = "cursor"
 
     if note:
         expr += ", #note=:n"
@@ -202,16 +208,28 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
 
-    if not cursor:
-        expr += " REMOVE #cursor"
-        names["#cursor"] = "cursor"
+    # IMPORTANT: only remove lease_owner if we own it (prevents clobber)
+    if lease_owner:
+        expr += " REMOVE #lease_owner"
+        names["#lease_owner"] = "lease_owner"
+        cond = "attribute_not_exists(#lease_owner) OR #lease_owner = :me"
+        vals[":me"] = lease_owner
 
-    TABLE.update_item(
-        Key={"job_start_id": job_start_id},
-        UpdateExpression=expr,
-        ExpressionAttributeNames=names,
-        ExpressionAttributeValues=vals,
-    )
+        TABLE.update_item(
+            Key={"job_start_id": job_start_id},
+            ConditionExpression=cond,
+            UpdateExpression=expr,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=vals,
+        )
+    else:
+        TABLE.update_item(
+            Key={"job_start_id": job_start_id},
+            UpdateExpression=expr,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=vals,
+        )
+
 
 def _ddb_done(job_start_id: str, note: str = "") -> None:
     _ddb_checkpoint(job_start_id, "DONE", page=0, cursor=None, note=note, last_error="")
