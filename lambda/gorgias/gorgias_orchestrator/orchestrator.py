@@ -199,7 +199,7 @@ def handler(event, context):
                 ":false": False,
                 ":true": True,
                 ":now": now,
-                ":lease": now + 900, 
+                ":lease": 0, 
             },
         )
     except ClientError:
