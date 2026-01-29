@@ -1412,6 +1412,33 @@ gorgias_messages_backfill_q, gorgias_messages_backfill_fn = make_gorgias_orchest
     job_start_id="gorgias_messages_backfill",
 )
 
+
+# -------------------------
+# Temporary Backfill Trigger (Heartbeat)
+# -------------------------
+# This rules ensures the Orchestrator checks the backfill status every minute
+# and restarts the worker if it paused due to time/page limits.
+
+gorgias_messages_backfill_rule = aws.cloudwatch.EventRule(
+    "gorgias-messages-backfill-rule",
+    name="gorgias-messages-backfill-heartbeat",
+    schedule_expression="rate(1 minute)",
+)
+
+aws.cloudwatch.EventTarget(
+    "gorgias-messages-backfill-target",
+    rule=gorgias_messages_backfill_rule.name,
+    arn=gorgias_orchestrator_fn.arn, # Reusing the existing Orchestrator Lambda
+    input='{"job_start_id":"gorgias_messages_backfill"}', # <--- THIS IS THE KEY
+)
+
+aws.lambda_.Permission(
+    "gorgias-messages-backfill-invoke",
+    action="lambda:InvokeFunction",
+    function=gorgias_orchestrator_fn.name,
+    principal="events.amazonaws.com",
+    source_arn=gorgias_messages_backfill_rule.arn,
+)
 # =========================
 # Exports
 # =========================
