@@ -354,10 +354,19 @@ def handler(event, context):
 
     logger.info(f"[{STREAM_NAME}] Lease acquired")
 
-    # Prepare for Loop
-    cursor = body.get("cursor") or state.get("cursor")
-    if cursor == "": cursor = None
-    page = int(body.get("page") or state.get("page") or 1)
+
+    # Prepare for Loop — DDB IS SOURCE OF TRUTH
+    cursor = state.get("cursor")
+    if cursor == "":
+        cursor = None
+
+    page = int(state.get("page") or 1)
+
+    # ONLY allow override for explicit manual replay
+    if body.get("force_override"):
+        cursor = body.get("cursor") or cursor
+        page = int(body.get("page") or page)
+
     
     processed = 0
     total_written = 0
