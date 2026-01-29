@@ -1,10 +1,13 @@
 """
-messages.py — Gorgias /search extractor (Hourly + Daily + Backfill)
+messages.py — Gorgias /messages extractor (Cursor Only - Full Production Version)
 
-MAJOR UPDATE:
-- Uses /api/search endpoint instead of /api/messages.
-- Enables efficient time-based filtering (Gap Fills take seconds, not hours).
-- Solves the "Oldest First" sorting trap.
+- Method: GET (Standard for /messages)
+- Logic: Cursor-based pagination (Start -> End).
+- Features:
+  - Robust Rate Limiting (429 handling with Jitter)
+  - Full Error Handling (4xx/5xx)
+  - DynamoDB Leases & Checkpointing
+  - Detailed Logging
 """
 
 import os
@@ -12,9 +15,8 @@ import json
 import time
 import random
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-import urllib.parse
 
 import boto3
 import requests
@@ -35,9 +37,9 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "sources-data")
 S3_PREFIX_BASE = os.environ.get("S3_PREFIX_BASE", "gorgias").strip("/")
 
 STREAM_NAME = "messages"
-ENDPOINT = "/search"  # <--- CHANGED TO SEARCH
+ENDPOINT = "/messages"
 
-PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "30")) # Search API max is often lower/different, safe default
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
 PAGES_PER_INVOCATION = int(os.environ.get("PAGES_PER_INVOCATION", "50"))
 
 # Rate limit + retries
@@ -45,6 +47,8 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "8"))
 BACKOFF_BASE_SECONDS = float(os.environ.get("BACKOFF_BASE_SECONDS", "1.0"))
 BACKOFF_MAX_SECONDS = float(os.environ.get("BACKOFF_MAX_SECONDS", "30.0"))
 MIN_SUCCESS_DELAY_SECONDS = float(os.environ.get("MIN_SUCCESS_DELAY_SECONDS", "0.2"))
+THROTTLE_RATIO = float(os.environ.get("THROTTLE_RATIO", "0.70"))
+THROTTLE_MAX_SLEEP_SECONDS = float(os.environ.get("THROTTLE_MAX_SLEEP_SECONDS", "2.0"))
 
 # Lambda time handling
 REQUEST_TIMEOUT = (10, 60)
@@ -100,6 +104,32 @@ def _time_left_ok(context, buffer_ms: int = TIME_LEFT_BUFFER_MS) -> bool:
     except Exception:
         return True
 
+def _parse_limit_header(headers: Dict[str, str]) -> Optional[Tuple[int, int]]:
+    h = headers.get("X-Gorgias-Account-Api-Call-Limit") or headers.get("x-gorgias-account-api-call-limit")
+    if not h:
+        return None
+    try:
+        used_s, limit_s = h.split("/", 1)
+        used = int(used_s.strip())
+        limit = int(limit_s.strip())
+        if limit <= 0:
+            return None
+        return used, limit
+    except Exception:
+        return None
+
+def _throttle_on_success(headers: Dict[str, str]) -> None:
+    parsed = _parse_limit_header(headers)
+    sleep_s = MIN_SUCCESS_DELAY_SECONDS if MIN_SUCCESS_DELAY_SECONDS > 0 else 0.0
+    if parsed:
+        used, limit = parsed
+        ratio = used / limit
+        if ratio >= THROTTLE_RATIO:
+            ramp = (ratio - THROTTLE_RATIO) / max(1e-9, (1.0 - THROTTLE_RATIO))
+            sleep_s = max(sleep_s, min(THROTTLE_MAX_SLEEP_SECONDS, 0.2 + ramp * THROTTLE_MAX_SLEEP_SECONDS))
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
 def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[Dict[str, Any]]) -> str:
     if not records:
         return ""
@@ -110,34 +140,7 @@ def _write_jsonl_to_s3(stream: str, job_start_id: str, page: int, records: List[
     logger.info(f"[{stream}] wrote s3://{S3_BUCKET}/{key} rows={len(records)}")
     return key
 
-# -------------------- Date / Query Logic --------------------
-def _build_search_query(target_date_str: str) -> str:
-    """
-    Constructs the Gorgias Lucene query for specific time windows.
-    Format: type:message AND created_datetime:>=2026-01-29 ...
-    """
-    base_query = "type:message"
-    
-    if not target_date_str:
-        # No date = Full Backfill (Be careful, Search API limits might apply, but this starts from everything)
-        return base_query
-
-    # Case 1: Daily -> "2026-01-29"
-    if len(target_date_str) == 10:
-        return f"{base_query} AND created_datetime:>={target_date_str} AND created_datetime:<{target_date_str}T23:59:59"
-
-    # Case 2: Hourly -> "2026-01-29T14"
-    # We construct strict ISO timestamps for that hour
-    try:
-        dt = datetime.strptime(target_date_str, "%Y-%m-%dT%H")
-        start_ts = dt.strftime("%Y-%m-%dT%H:00:00") # Search API prefers simple ISO or YYYY-MM-DD
-        end_ts = (dt + timedelta(minutes=59, seconds=59)).strftime("%Y-%m-%dT%H:%M:%S")
-        return f"{base_query} AND created_datetime:>={start_ts} AND created_datetime:<={end_ts}"
-    except ValueError:
-        logger.warning(f"Could not parse target_date: {target_date_str}, falling back to daily assumption")
-        return f"{base_query} AND created_datetime:>={target_date_str}"
-
-# -------------------- DDB State --------------------
+# -------------------- DDB State / Lease --------------------
 def _ddb_get(job_start_id: str) -> Optional[Dict[str, Any]]:
     resp = TABLE.get_item(Key={"job_start_id": job_start_id})
     return resp.get("Item")
@@ -150,7 +153,12 @@ def _ddb_acquire_lease(job_start_id: str, request_id: str) -> bool:
             Key={"job_start_id": job_start_id},
             UpdateExpression="SET lease_until=:lu, lease_owner=:lo, in_flight=:t, updated_at=:now",
             ConditionExpression="attribute_not_exists(lease_until) OR lease_until <= :now OR lease_owner = :lo",
-            ExpressionAttributeValues={":lu": lease_until, ":lo": request_id, ":t": True, ":now": now},
+            ExpressionAttributeValues={
+                ":lu": lease_until,
+                ":lo": request_id,
+                ":t": True,
+                ":now": now,
+            },
         )
         return True
     except ClientError as e:
@@ -168,10 +176,12 @@ def _ddb_renew_lease(job_start_id: str, request_id: str) -> None:
             ConditionExpression="lease_owner = :lo",
             ExpressionAttributeValues={":lu": lease_until, ":now": now, ":lo": request_id},
         )
-    except ClientError:
-        pass
+    except ClientError as e:
+        if e.response["Error"].get("Code") == "ConditionalCheckFailedException":
+            return
+        raise
 
-def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str], note: str = "") -> None:
+def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[str], note: str = "", last_error: str = "") -> None:
     now = _utc_now_ts()
     expr = "SET #status=:s, #page=:p, #updated_at=:now, in_flight=:f"
     names = {"#status": "status", "#page": "page", "#updated_at": "updated_at"}
@@ -181,10 +191,17 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
         expr += ", #cursor=:c"
         names["#cursor"] = "cursor"
         vals[":c"] = cursor
+
     if note:
         expr += ", #note=:n"
         names["#note"] = "note"
         vals[":n"] = note[:2000]
+
+    if last_error:
+        expr += ", #last_error=:e"
+        names["#last_error"] = "last_error"
+        vals[":e"] = last_error[:2000]
+
     if not cursor:
         expr += " REMOVE #cursor"
         names["#cursor"] = "cursor"
@@ -197,17 +214,10 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
     )
 
 def _ddb_done(job_start_id: str, note: str = "") -> None:
-    _ddb_checkpoint(job_start_id, "DONE", page=0, cursor=None, note=note)
+    _ddb_checkpoint(job_start_id, "DONE", page=0, cursor=None, note=note, last_error="")
 
 def _ddb_error(job_start_id: str, page: int, cursor: Optional[str], err: str) -> None:
-    # Error state but keep cursor to retry
-    now = _utc_now_ts()
-    TABLE.update_item(
-        Key={"job_start_id": job_start_id},
-        UpdateExpression="SET #status=:s, last_error=:e, in_flight=:f, updated_at=:now",
-        ExpressionAttributeNames={"#status": "status"},
-        ExpressionAttributeValues={":s": "ERROR", ":e": err[:2000], ":f": False, ":now": now}
-    )
+    _ddb_checkpoint(job_start_id, "ERROR", page=page, cursor=cursor, note="error", last_error=err)
 
 # -------------------- API Fetcher --------------------
 def _request_with_backoff(session: requests.Session, method: str, url: str, params: Dict[str, Any], auth: Tuple[str, str], bearer_key: str) -> requests.Response:
@@ -219,78 +229,94 @@ def _request_with_backoff(session: requests.Session, method: str, url: str, para
             r = session.request(method, url, params=params, auth=auth, timeout=REQUEST_TIMEOUT)
             last_resp = r
             
-            if r.status_code == 401: # Auth retry
+            # 1. Auth Retry
+            if r.status_code == 401:
                 r = session.request(method, url, params=params, headers={"Authorization": f"Bearer {bearer_key}"}, timeout=REQUEST_TIMEOUT)
                 last_resp = r
 
-            if r.status_code == 429: # Rate Limit
+            # 2. Rate Limit
+            if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
-                sleep_s = float(retry_after) if retry_after else backoff + random.random()
-                logger.warning(f"[{STREAM_NAME}] 429. sleeping {sleep_s:.2f}s")
+                if retry_after:
+                    try:
+                        sleep_s = float(retry_after)
+                    except:
+                        sleep_s = backoff
+                else:
+                    sleep_s = backoff + random.random()
+                
+                logger.warning(f"[{STREAM_NAME}] 429 rate limited. attempt={attempt}. sleeping {sleep_s:.2f}s")
                 time.sleep(sleep_s)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
                 continue
             
-            if r.status_code >= 500: # Server Error
-                time.sleep(backoff)
+            # 3. Server Errors
+            if r.status_code >= 500:
+                sleep_s = backoff + random.random()
+                logger.warning(f"[{STREAM_NAME}] {r.status_code} server error. attempt={attempt}. sleeping {sleep_s:.2f}s")
+                time.sleep(sleep_s)
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
                 continue
             
-            if r.status_code >= 400: # Client Error - Crash Immediately
-                logger.error(f"[{STREAM_NAME}] 4xx Error: {r.text}")
+            # 4. Client Errors (400) -> Raise to stop
+            if r.status_code >= 400:
+                logger.error(f"[{STREAM_NAME}] API Error {r.status_code}: {r.text[:500]}")
                 r.raise_for_status()
 
             return r
 
         except requests.exceptions.RequestException as e:
+            logger.warning(f"[{STREAM_NAME}] Network error: {e}")
             time.sleep(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
 
-    raise RuntimeError(f"Exceeded max retries. Status: {last_resp.status_code if last_resp else 'None'}")
+    raise RuntimeError(f"Exceeded max retries. Last status: {last_resp.status_code if last_resp else 'None'}")
 
-def _fetch_page(session, cursor, target_date_str):
+def _fetch_page(session, cursor):
+    """
+    Fetches a single page of messages.
+    Logic: Uses cursor + limit. NO order_by (API default).
+    """
     email, api_key = _gorgias_auth()
     url = f"{GORGIAS_BASE_URL}{ENDPOINT}"
     
-    # BUILD SEARCH QUERY
-    query = _build_search_query(target_date_str)
-    
-    params = {
-        "query": query,
-        "limit": PAGE_SIZE,
-        "order_by": "created_datetime:desc" # Search supports desc!
-    }
+    params = {"limit": PAGE_SIZE}
     if cursor:
         params["cursor"] = cursor
 
-    logger.info(f"[{STREAM_NAME}] Searching: {query} | Cursor: {'Yes' if cursor else 'No'}")
+    logger.info(f"[{STREAM_NAME}] Fetching cursor={cursor[:30] if cursor else 'START'}...")
 
     r = _request_with_backoff(session, "GET", url, params, (email, api_key), api_key)
-    
-    j = r.json()
-    items = j.get("data") or []
-    meta = j.get("meta") or {}
-    next_cursor = meta.get("cursor") or meta.get("next_cursor") # Search uses 'cursor' in meta usually
+    headers = dict(r.headers)
+    _throttle_on_success(headers)
 
-    return items, next_cursor
+    j = r.json()
+    items = j.get("data") or j.get("messages") or []
+    
+    meta = j.get("meta") or {}
+    next_cursor = meta.get("next_cursor") or meta.get("cursor_next")
+    
+    return items, next_cursor, headers
 
 # -------------------- Main Handler --------------------
 def handler(event, context):
     request_id = getattr(context, "aws_request_id", "no_context")
+    logger.info(f"[{STREAM_NAME}] START request_id={request_id}")
     
     # Parse input
     record = (event.get("Records") or [None])[0] if isinstance(event, dict) else None
     body = {}
     if record and isinstance(record, dict) and record.get("body"):
-        try: body = json.loads(record["body"])
-        except: body = {"raw_body": record["body"]}
+        try:
+            body = json.loads(record["body"])
+        except:
+            body = {"raw_body": record["body"]}
     elif isinstance(event, dict):
         body = event
 
     job_start_id = body.get("job_start_id")
-    target_date_str = body.get("target_date")
-
     if not job_start_id:
+        logger.error(f"[{STREAM_NAME}] Missing job_start_id")
         return {"ok": False, "reason": "missing_job_start_id"}
 
     # Check State
@@ -300,11 +326,17 @@ def handler(event, context):
         return {"ok": False, "reason": "missing_state"}
     
     if state.get("status") != "RUNNING":
+        logger.info(f"[{STREAM_NAME}] Skipping - status={state.get('status')}")
         return {"ok": True, "skipped": True, "status": state.get("status")}
 
+    # Acquire Lease
     if not _ddb_acquire_lease(job_start_id, request_id):
+        logger.info(f"[{STREAM_NAME}] Lease busy")
         return {"ok": True, "skipped": True, "reason": "lease_busy"}
 
+    logger.info(f"[{STREAM_NAME}] Lease acquired")
+
+    # Prepare for Loop
     cursor = body.get("cursor") or state.get("cursor")
     if cursor == "": cursor = None
     page = int(body.get("page") or state.get("page") or 1)
@@ -319,26 +351,37 @@ def handler(event, context):
                 _ddb_renew_lease(job_start_id, request_id)
 
             try:
-                items, next_cursor = _fetch_page(session, cursor, target_date_str)
+                items, next_cursor, headers = _fetch_page(session, cursor)
             except RuntimeError as e:
-                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused: {e}")
+                msg = str(e)
+                logger.warning(f"[{STREAM_NAME}] Transient failure: {msg}")
+                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused: {msg}")
                 return {"ok": True, "done": False, "reason": "transient_error"}
 
-            if items:
-                _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
-                total_written += len(items)
+            if not items:
+                _ddb_done(job_start_id, "completed (no items)")
+                return {"ok": True, "done": True}
+
+            # Write ALL items (Cursor logic = simple pagination)
+            _write_jsonl_to_s3(STREAM_NAME, job_start_id, page, items)
+            total_written += len(items)
 
             processed += 1
             cursor = next_cursor
             page += 1
 
+            # Stop condition: No more pages from API
             if not cursor:
-                _ddb_done(job_start_id, f"completed (wrote {total_written} items)")
+                _ddb_done(job_start_id, "completed (end of stream)")
                 return {"ok": True, "done": True}
 
+            # Checkpoint
             if processed % CHECKPOINT_EVERY_PAGES == 0:
-                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"page {page}")
+                _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"page {page}, wrote {total_written}")
+                logger.info(f"[{STREAM_NAME}] Checkpoint at page {page}")
 
+        # Pausing (time/page limit)
+        logger.info(f"[{STREAM_NAME}] Pausing at page {page} (wrote {total_written} this run)")
         _ddb_checkpoint(job_start_id, "RUNNING", page, cursor, note=f"paused at page {page}")
         return {"ok": True, "done": False}
 

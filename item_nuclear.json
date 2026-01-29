@@ -1,7 +1,0 @@
-{
-    "job_start_id": {"S": "gorgias_messages_gap_2026_01_29"},
-    "status": {"S": "RUNNING"},
-    "page": {"N": "1"},
-    "in_flight": {"BOOL": false},
-    "lease_until": {"N": "0"}
-}

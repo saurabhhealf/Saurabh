@@ -1,3 +1,12 @@
+"""
+orchestrator.py — Scheduling & Backfill Logic
+
+Handles:
+1. Daily triggers (checking time windows).
+2. One-off Backfills (disabling rules when done).
+3. State management & Locking.
+"""
+
 import os
 import json
 import time
@@ -21,7 +30,6 @@ TABLE = _ddb.Table(STATE_TABLE)
 
 # --- Configuration ---
 # "frequency": "daily" -> Checks 'start_hour'. Target is Yesterday.
-# "frequency": "hourly" -> Runs always. Target is Previous Hour.
 SCHEDULE_CONFIG = {
     "customers": {
         "frequency": "daily",
@@ -33,10 +41,13 @@ SCHEDULE_CONFIG = {
         "start_hour": 3,   # 03:00 UTC
         "days_back": 1,
     },
-    "messages": {
-        "frequency": "hourly", 
-        # No start_hour needed; logic runs whenever triggered (every min/hr)
-    },
+    # "messages": {
+    #     # DISABLED to allow manual backfill to run without collision.
+    #     # Uncomment when backfill is done to resume daily schedule.
+    #     "frequency": "daily",
+    #     "start_hour": 4,   # 04:00 UTC
+    #     "days_back": 1,
+    # },
     "satisfaction_surveys": {
         "frequency": "daily",
         "start_hour": 5,   # 05:00 UTC
@@ -68,9 +79,7 @@ def handler(event, context):
         raise ValueError("Missing job_start_id in event input")
 
     # Determine Mode based on job ID string
-    # We assume IDs like "gorgias_messages_daily" or "gorgias_messages_hourly"
-    # Logic detects if it's a scheduled job vs a one-off backfill
-    IS_SCHEDULED = "daily" in job_start_id or "hourly" in job_start_id
+    IS_SCHEDULED = "daily" in job_start_id
     
     ORCHESTRATOR_RULE_NAME = os.environ.get("ORCHESTRATOR_RULE_NAME", "").strip()
     STREAM_NAME = os.environ.get("STREAM_NAME", "").strip().lower()
@@ -79,37 +88,30 @@ def handler(event, context):
     now_dt = datetime.now(timezone.utc)
 
     # ==========================================
-    # 1. SCHEDULED JOB LOGIC (Daily OR Hourly)
+    # 1. SCHEDULED JOB LOGIC (Daily)
     # ==========================================
     if IS_SCHEDULED:
         config = SCHEDULE_CONFIG.get(STREAM_NAME, {})
-        frequency = config.get("frequency", "daily")
-        target_reference = ""
+        if not config:
+            # If config is missing (e.g., messages commented out), we skip nicely.
+            logger.info(f"[orchestrator] Schedule disabled for {STREAM_NAME}. Skipping.")
+            return {"enqueued": False, "reason": "schedule_disabled"}
 
-        # --- A. DAILY LOGIC ---
-        if frequency == "daily":
-            start_hour = config.get("start_hour", DEFAULT_START_HOUR)
-            days_back = config.get("days_back", DEFAULT_DAYS_BACK)
+        start_hour = config.get("start_hour", DEFAULT_START_HOUR)
+        days_back = config.get("days_back", DEFAULT_DAYS_BACK)
 
-            # Strict Window Check: Only run if current hour matches start_hour
-            if now_dt.hour != start_hour:
-                return {
-                    "enqueued": False,
-                    "reason": "outside_daily_window",
-                    "stream": STREAM_NAME,
-                    "current_hour": now_dt.hour,
-                    "expected_hour": start_hour,
-                }
-            
-            # Target: Yesterday (e.g., "2026-01-29")
-            target_reference = (now_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-
-        # --- B. HOURLY LOGIC ---
-        elif frequency == "hourly":
-            # Target: Previous Hour (e.g., "2026-01-29T14")
-            # We subtract 1 hour to fetch the full "last completed hour"
-            prev_hour_dt = now_dt - timedelta(hours=1)
-            target_reference = prev_hour_dt.strftime("%Y-%m-%dT%H")
+        # Strict Window Check: Only run if current hour matches start_hour
+        if now_dt.hour != start_hour:
+            return {
+                "enqueued": False,
+                "reason": "outside_daily_window",
+                "stream": STREAM_NAME,
+                "current_hour": now_dt.hour,
+                "expected_hour": start_hour,
+            }
+        
+        # Target: Yesterday (e.g., "2026-01-29")
+        target_reference = (now_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
         # --- C. STATE MANAGEMENT ---
         item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
@@ -128,18 +130,17 @@ def handler(event, context):
             item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
 
         # CHECK FOR NEW WINDOW -> RESET STATE
-        # 'run_reference' tracks the specific Day or Hour we are processing.
         stored_ref = item.get("run_reference") or item.get("run_date", "")
 
         if stored_ref != target_reference:
-            logger.info(f"[orchestrator] New window ({frequency})! Resetting {job_start_id} to {target_reference}")
+            logger.info(f"[orchestrator] New window! Resetting {job_start_id} to {target_reference}")
             TABLE.update_item(
                 Key={"job_start_id": job_start_id},
                 UpdateExpression="SET #status=:r, #page=:p, #run_ref=:ref, #lease_until=:z REMOVE #cursor",
                 ExpressionAttributeNames={
                     "#status": "status",
                     "#page": "page",
-                    "#run_ref": "run_reference", # Unified field for date or hour string
+                    "#run_ref": "run_reference", 
                     "#lease_until": "lease_until",
                     "#cursor": "cursor",
                 },
@@ -157,7 +158,7 @@ def handler(event, context):
             return {"enqueued": False, "reason": "done_for_window", "reference": target_reference}
 
     # ==========================================
-    # 2. BACKFILL JOB LOGIC (One-off)
+    # 2. BACKFILL JOB LOGIC (One-off / Continuous)
     # ==========================================
     else:
         item = TABLE.get_item(Key={"job_start_id": job_start_id}).get("Item")
@@ -199,7 +200,7 @@ def handler(event, context):
                 ":false": False,
                 ":true": True,
                 ":now": now,
-                ":lease": 0, 
+                ":lease": now + 900, 
             },
         )
     except ClientError:
@@ -214,9 +215,8 @@ def handler(event, context):
     if cursor:
         body["cursor"] = cursor
 
-    # Pass the calculated target (Day or Hour) to the worker
+    # Pass the calculated target (Day) to the worker if scheduled
     if IS_SCHEDULED:
-        # 'target_date' is generic; for hourly jobs it will be "YYYY-MM-DDTHH"
         body["target_date"] = item.get("run_reference") or item.get("run_date")
 
     try:
