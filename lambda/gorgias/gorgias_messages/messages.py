@@ -185,51 +185,71 @@ def _ddb_checkpoint(job_start_id: str, status: str, page: int, cursor: Optional[
                     note: str = "", last_error: str = "", lease_owner: Optional[str] = None) -> None:
     now = _utc_now_ts()
 
-    expr = "SET #status=:s, #page=:p, #updated_at=:now, in_flight=:f, #lease_until=:z"
-    names = {"#status": "status", "#page": "page", "#updated_at": "updated_at", "#lease_until": "lease_until"}
-    vals = {":s": status, ":p": page, ":now": now, ":f": False, ":z": 0}
+    # 1. Build the SET part
+    set_actions = [
+        "#status=:s", 
+        "#page=:p", 
+        "#updated_at=:now", 
+        "in_flight=:f", 
+        "#lease_until=:z"
+    ]
+    names = {
+        "#status": "status", 
+        "#page": "page", 
+        "#updated_at": "updated_at", 
+        "#lease_until": "lease_until"
+    }
+    vals = {
+        ":s": status, 
+        ":p": page, 
+        ":now": now, 
+        ":f": False, 
+        ":z": 0
+    }
 
-    # keep cursor if present
     if cursor:
-        expr += ", #cursor=:c"
+        set_actions.append("#cursor=:c")
         names["#cursor"] = "cursor"
         vals[":c"] = cursor
-    else:
-        expr += " REMOVE #cursor"
-        names["#cursor"] = "cursor"
-
+    
     if note:
-        expr += ", #note=:n"
+        set_actions.append("#note=:n")
         names["#note"] = "note"
         vals[":n"] = note[:2000]
 
     if last_error:
-        expr += ", #last_error=:e"
+        set_actions.append("#last_error=:e")
         names["#last_error"] = "last_error"
         vals[":e"] = last_error[:2000]
 
-    # IMPORTANT: only remove lease_owner if we own it (prevents clobber)
+    # 2. Build the REMOVE part
+    remove_actions = []
+    if not cursor:
+        remove_actions.append("#cursor")
+        names["#cursor"] = "cursor"
+    
     if lease_owner:
-        expr += " REMOVE #lease_owner"
+        remove_actions.append("#lease_owner")
         names["#lease_owner"] = "lease_owner"
-        cond = "attribute_not_exists(#lease_owner) OR #lease_owner = :me"
         vals[":me"] = lease_owner
 
-        TABLE.update_item(
-            Key={"job_start_id": job_start_id},
-            ConditionExpression=cond,
-            UpdateExpression=expr,
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues=vals,
-        )
-    else:
-        TABLE.update_item(
-            Key={"job_start_id": job_start_id},
-            UpdateExpression=expr,
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues=vals,
-        )
+    # 3. Combine into one expression
+    update_expr = "SET " + ", ".join(set_actions)
+    if remove_actions:
+        update_expr += " REMOVE " + ", ".join(remove_actions)
 
+    # 4. Execute
+    update_params = {
+        "Key": {"job_start_id": job_start_id},
+        "UpdateExpression": update_expr,
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": vals,
+    }
+
+    if lease_owner:
+        update_params["ConditionExpression"] = "attribute_not_exists(#lease_owner) OR #lease_owner = :me"
+
+    TABLE.update_item(**update_params)
 
 def _ddb_done(job_start_id: str, note: str = "") -> None:
     _ddb_checkpoint(job_start_id, "DONE", page=0, cursor=None, note=note, last_error="")
