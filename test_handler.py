@@ -13,7 +13,7 @@ sys.path.insert(0, r"d:\shopify\Supabase\src\product_enrichment_supabase_lambda"
 
 SERVER_PAGE_CAP = 3          # force multi-page paging (real Supabase caps at 1000)
 SERVICE_KEY = "test-service-role-key"
-SCHEMA = "product-enrichment"
+SCHEMA = "product_enrichment"
 
 # (id, raw JSON text) -- exactly the bytes PostgREST would emit.
 PRODUCTS = [

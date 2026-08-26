@@ -1,13 +1,13 @@
 # Product Enrichment (Supabase) → S3
 
-Twice-daily full snapshot of the Supabase `product-enrichment` schema into S3.
+Twice-daily full snapshot of the Supabase `product_enrichment` schema into S3.
 
 | | |
 |---|---|
 | Lambda | `product-enrichment-supabase` |
 | Schedule (EventBridge rule) | `product-enrichment-supabase-schedule` — `cron(0 6,18 * * ? *)` |
 | Runs at | **06:00 UTC** and **18:00 UTC**, every day |
-| Source | Supabase project `product-database`, schema `product-enrichment`, tables `products` and `ingredients` |
+| Source | Supabase project `product-database`, schema `product_enrichment`, tables `products` and `ingredients` |
 | Destination | `s3://sources-data/supabase/` |
 | Region | `eu-west-2` |
 | Logs | CloudWatch → `/aws/lambda/product-enrichment-supabase` |
@@ -83,9 +83,10 @@ against a fake PostgREST server.
 
 ## Supabase credentials
 
-This pipeline uses the **`service_role` API key** over Supabase's REST API. It
-does **not** need the database password, and it does not need the account
-password either.
+This pipeline uses a **secret API key** over Supabase's REST API — the
+`sb_secret_...` key under **Secret keys** in newer Supabase projects (older
+projects call the equivalent key `service_role`, a JWT). It does **not** need
+the database password, and it does not need the account password either.
 
 > Note it cannot use the direct Postgres host. `db.<project-ref>.supabase.co`
 > resolves to an IPv6 address only, and a Lambda outside a VPC has no IPv6
@@ -93,20 +94,20 @@ password either.
 
 ### 1. Get the key
 
-**Project Settings → API keys → `service_role`** (marked *secret*). Copy it.
+**Project Settings → API keys → Secret keys** → the `default` row. Copy it.
 
-The `service_role` key bypasses row-level security, so treat it like a
-password: never commit it, always set it with `--secret`.
+This key bypasses row-level security, so treat it like a password: never
+commit it, always set it with `--secret`.
 
 ### 2. Expose the schema
 
-`product-enrichment` is not the default `public` schema, so PostgREST will not
+`product_enrichment` is not the default `public` schema, so PostgREST will not
 serve it until it is exposed:
 
-**Project Settings → API → Exposed schemas** → add `product-enrichment` → Save.
+**Project Settings → API → Exposed schemas** → add `product_enrichment` → Save.
 
 Without this every request comes back `404` / `406`. The Lambda sends an
-`Accept-Profile: product-enrichment` header to select it.
+`Accept-Profile: product_enrichment` header to select it.
 
 ---
 
@@ -121,12 +122,12 @@ python -m venv venv
 ./venv/Scripts/pip install -r requirements.txt      # Windows
 # source venv/bin/activate && pip install -r requirements.txt   # macOS/Linux
 
-# 2. Select the stack (org is healf-org)
-pulumi stack select healf-org/product-enrichment-supabase/dev
-#   first time:  pulumi stack init healf-org/product-enrichment-supabase/dev
+# 2. Select the stack (org is healfz-org)
+pulumi stack select healfz-org/product-enrichment-supabase/dev
+#   first time:  pulumi stack init healfz-org/product-enrichment-supabase/dev
 
 # 3. The one secret. supabaseUrl is already set in Pulumi.dev.yaml.
-pulumi config set --secret supabaseServiceKey '<service_role key>'
+pulumi config set --secret supabaseServiceKey '<secret API key>'
 
 # 4. Ship it
 pulumi up

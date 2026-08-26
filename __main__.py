@@ -4,8 +4,8 @@ Product Enrichment (Supabase) Pipeline — Pulumi infrastructure definition.
 Deploys one Lambda + one EventBridge rule:
   - product-enrichment-supabase (Lambda)
       Reads a FULL snapshot of these Supabase tables, via the REST API:
-        product-enrichment.products
-        product-enrichment.ingredients
+        product_enrichment.products
+        product_enrichment.ingredients
       Writes:
         s3://sources-data/supabase/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/products.csv
         s3://sources-data/supabase/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/ingredients.csv
@@ -19,8 +19,8 @@ The destination bucket is NOT managed here — Pulumi only grants the Lambda
 permission to write into it (same approach as the crm-klaviyo pipeline).
 
 Deploy: see README.md. Short version —
-  pulumi stack select healf-org/product-enrichment-supabase/dev
-  pulumi config set --secret supabaseServiceKey '<service_role key>'
+  pulumi stack select healfz-org/product-enrichment-supabase/dev
+  pulumi config set --secret supabaseServiceKey '<secret API key>'
   pulumi up
 """
 
@@ -39,8 +39,9 @@ S3_PREFIX = "supabase"
 # Single rule, both slots. 06:00 and 18:00 UTC every day.
 SCHEDULE = "cron(0 6,18 * * ? *)"
 
-# Postgres schema holding the tables (NOT the Supabase project name).
-SUPABASE_SCHEMA = "product-enrichment"
+# Postgres schema holding the tables (NOT the Supabase project name, which is
+# `product-database` — a different, unrelated string).
+SUPABASE_SCHEMA = "product_enrichment"
 SUPABASE_TABLES = "products,ingredients"
 
 # PostgREST caps a page at its `max-rows` setting (1000 by default). Asking for

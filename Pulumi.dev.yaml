@@ -1,3 +1,5 @@
 config:
   aws:region: eu-west-2
   product-enrichment-supabase:supabaseUrl: https://dvldaqewdnrycaecuhjw.supabase.co
+  product-enrichment-supabase:supabaseServiceKey:
+    secure: AAABANn5ZpuE/hnE4JSrvqPURwqPuPY/JsUZFMJeY+dZ9c8tfD+Cod6IlyENOpjXR1IX4m7+LShtbXIjhRqwh2Nz9nLlI5oyuw==
