@@ -7,8 +7,8 @@ Deploys one Lambda + one EventBridge rule:
         product_enrichment.products
         product_enrichment.ingredients
       Writes:
-        s3://sources-data/supabase/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/products.csv
-        s3://sources-data/supabase/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/ingredients.csv
+        s3://shopify-products-metadata/supabase/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/products.csv
+        s3://shopify-products-metadata/supabase/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/ingredients.csv
       Fires at 06:00 and 18:00 UTC daily via a single EventBridge rule.
 
 Names are deliberately distinct from the existing product-enrichment
@@ -32,8 +32,8 @@ import pulumi_aws as aws
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
-# Destination: bucket `sources-data`, top-level prefix `supabase/`.
-BUCKET_NAME = "sources-data"
+# Destination: bucket `shopify-products-metadata`, top-level prefix `supabase/`.
+BUCKET_NAME = "shopify-products-metadata"
 S3_PREFIX = "supabase"
 
 # Single rule, both slots. 06:00 and 18:00 UTC every day.

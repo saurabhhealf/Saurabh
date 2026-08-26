@@ -6,8 +6,8 @@ REST API (PostgREST) and writes it as CSV to S3 under a date/time folder pair:
 
     s3://{bucket}/{prefix}/{YYYY-MM-DD}/{YYYY-MM-DD_HH:MM:SS}/{table}.csv
 
-e.g. s3://sources-data/supabase/2026-08-26/2026-08-26_06:00:00/products.csv
-     s3://sources-data/supabase/2026-08-26/2026-08-26_18:00:00/products.csv
+e.g. s3://shopify-products-metadata/supabase/2026-08-26/2026-08-26_06:00:00/products.csv
+     s3://shopify-products-metadata/supabase/2026-08-26/2026-08-26_18:00:00/products.csv
 
 The date folder is the UTC date of the run and the time folder is the UTC
 timestamp of the actual invocation, so scheduled runs and manual test

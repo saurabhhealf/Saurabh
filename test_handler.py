@@ -105,7 +105,7 @@ os.environ.update({
     "SUPABASE_SCHEMA": SCHEMA,
     "SUPABASE_TABLES": "products,ingredients",
     "PAGE_SIZE": "1000",
-    "S3_BUCKET_NAME": "sources-data",
+    "S3_BUCKET_NAME": "shopify-products-metadata",
     "S3_PREFIX": "supabase",
 })
 

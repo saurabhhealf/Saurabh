@@ -8,7 +8,7 @@ Twice-daily full snapshot of the Supabase `product_enrichment` schema into S3.
 | Schedule (EventBridge rule) | `product-enrichment-supabase-schedule` — `cron(0 6,18 * * ? *)` |
 | Runs at | **06:00 UTC** and **18:00 UTC**, every day |
 | Source | Supabase project `product-database`, schema `product_enrichment`, tables `products` and `ingredients` |
-| Destination | `s3://sources-data/supabase/` |
+| Destination | `s3://shopify-products-metadata/supabase/` |
 | Region | `eu-west-2` |
 | Logs | CloudWatch → `/aws/lambda/product-enrichment-supabase` |
 
@@ -24,7 +24,7 @@ Each run takes a **full snapshot** — the entire table every time, no increment
 ## Output layout
 
 ```
-s3://sources-data/supabase/
+s3://shopify-products-metadata/supabase/
 └── 2026-08-26/                       <- UTC date of the run
     ├── 2026-08-26_06:00:00/          <- UTC timestamp of the invocation
     │   ├── products.csv
@@ -140,10 +140,14 @@ Manager with a `secretsmanager:GetSecretValue` grant on the role.
 
 ### Destination bucket
 
-Pulumi does **not** create or manage `sources-data` — it only grants the Lambda
-permission to write into it, the same way the `crm-klaviyo` pipeline treats
-`engineering-s3-data-share`. The bucket and prefix are set at the top of
-[__main__.py](__main__.py) if they ever need to move.
+Pulumi does **not** create or manage `shopify-products-metadata` — it only
+grants the Lambda permission to write into it, the same way the `crm-klaviyo`
+pipeline treats `engineering-s3-data-share`. This bucket is also used by the
+existing `product-enrichment` (Snowflake) pipeline, under different
+top-level prefixes (`edible/`, `apparel_accessories/`, etc.) — this pipeline
+writes under its own `supabase/` prefix, so the two don't collide. The bucket
+and prefix are set at the top of [__main__.py](__main__.py) if they ever
+need to move.
 
 ---
 
@@ -155,7 +159,7 @@ aws lambda invoke \
   --region eu-west-2 \
   /dev/stdout
 
-aws s3 ls "s3://sources-data/supabase/$(date -u +%F)/" --recursive
+aws s3 ls "s3://shopify-products-metadata/supabase/$(date -u +%F)/" --recursive
 ```
 
 A successful run returns the row count per table and the exact S3 folder it
