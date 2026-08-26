@@ -1,0 +1,3 @@
+config:
+  aws:region: eu-west-2
+  product-enrichment-supabase:supabaseUrl: https://dvldaqewdnrycaecuhjw.supabase.co

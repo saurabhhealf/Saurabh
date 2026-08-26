@@ -1,0 +1,11 @@
+name: product-enrichment-supabase
+description: Supabase product-database snapshot (products, ingredients) to S3 — runs at 06:00 and 18:00 UTC daily.
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python

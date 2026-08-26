@@ -1,0 +1,5 @@
+# No third-party dependencies.
+#
+# The handler uses only the Python standard library (urllib, json, csv) plus
+# boto3, which the Lambda runtime already provides. Nothing needs vendoring
+# into this folder and there is no build step before `pulumi up`.
