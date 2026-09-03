@@ -5,3 +5,11 @@ __pycache__/
 *.pyd
 .env
 .env.*
+
+# Vendored Lambda deps (build artifact from `pip install -t`, not source)
+src/crm_profile_klaviyo_lambda/*
+!src/crm_profile_klaviyo_lambda/handler.py
+!src/crm_profile_klaviyo_lambda/requirements.txt
+
+# Local test artifacts
+response.json
