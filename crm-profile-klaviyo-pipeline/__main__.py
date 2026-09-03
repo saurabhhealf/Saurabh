@@ -94,7 +94,7 @@ crm_lambda = aws.lambda_.Function(
     environment={"variables": {
         "SNOWFLAKE_USER":        "SJ_SERVICE_USER",
         "SNOWFLAKE_ACCOUNT":     "GWNDCGK-GN77379",
-        "SNOWFLAKE_WAREHOUSE":   "HEALF_SERVICE_WH",
+        "SNOWFLAKE_WAREHOUSE":   "HEALF_WH",
         "SNOWFLAKE_DATABASE":    "HEALF",
         "SNOWFLAKE_SCHEMA":      "HEALF_BI",
         "SNOWFLAKE_ROLE":        "PC_THOUGHTSPOT_ROLE",
